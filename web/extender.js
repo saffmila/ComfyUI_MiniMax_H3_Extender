@@ -81,6 +81,10 @@ const PROJECT_WIDGETS = [
     "megapixels",
     "refs_json",
     "generation_mode",
+    "pdd_acc_lora",
+    "pdd_nfe",
+    "pdd_lora_strength",
+    "pdd_head_strength",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
@@ -1219,11 +1223,39 @@ function setNativeWidgetVisibility(node, widget, visible) {
     node?.graph?.setDirtyCanvas(true, true);
 }
 
+function isPddAccActive(node, runtime) {
+    const widget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
+    const value = String(widget?.value ?? "None").trim();
+    return Boolean(value) && value !== "None";
+}
+
 function syncModeSpecificNativeWidgets(node, runtime, fl2vaMode) {
     // Motion Context controls have no meaning in FL2VA. Hide them only in that
     // mode while keeping their values intact for the independent Ref2VA state.
     setNativeWidgetVisibility(node, runtime?.contextLengthWidget, !fl2vaMode);
     setNativeWidgetVisibility(node, runtime?.audioContextLengthWidget, !fl2vaMode);
+
+    // When PDD Acc is selected the backend uses the trained sigma grid from
+    // pdd_nfe. Hide the ordinary steps/scheduler so they cannot confuse the run.
+    const pddActive = isPddAccActive(node, runtime);
+    setNativeWidgetVisibility(node, runtime?.stepsWidget, !pddActive);
+    setNativeWidgetVisibility(node, runtime?.schedulerWidget, !pddActive);
+}
+
+function installPddWidgetHooks(node, runtime) {
+    const pddWidget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
+    if (!pddWidget || pddWidget.__h3PddHooked) return;
+    pddWidget.__h3PddHooked = true;
+    const prev = pddWidget.callback;
+    pddWidget.callback = function () {
+        if (typeof prev === "function") prev.apply(this, arguments);
+        syncModeSpecificNativeWidgets(
+            node,
+            runtime,
+            String(runtime?.state?.generation_mode || "ref2va") === "fl2va",
+        );
+        node?.graph?.setDirtyCanvas(true, true);
+    };
 }
 
 function domWidgetRenderMode(element) {
@@ -3503,6 +3535,9 @@ function buildUi(node) {
     const generationModeWidget = getWidget(node, "generation_mode");
     const contextLengthWidget = getWidget(node, "context_length");
     const audioContextLengthWidget = getWidget(node, "audio_context_length");
+    const stepsWidget = getWidget(node, "steps");
+    const schedulerWidget = getWidget(node, "scheduler");
+    const pddAccLoraWidget = getWidget(node, "pdd_acc_lora");
     if (!jsonWidget || !refsWidget || !generationModeWidget) return null;
     hideNativeWidget(node, jsonWidget);
     hideNativeWidget(node, refsWidget);
@@ -3711,6 +3746,9 @@ function buildUi(node) {
         generationModeWidget,
         contextLengthWidget,
         audioContextLengthWidget,
+        stepsWidget,
+        schedulerWidget,
+        pddAccLoraWidget,
         modeButton,
         pendingRefSlot: -1,
         pendingFrameClip: -1,
@@ -3832,6 +3870,7 @@ function buildUi(node) {
 
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
+    installPddWidgetHooks(node, runtime);
     render(node, runtime);
     refreshLoraNames(node, runtime);
 

@@ -36,6 +36,39 @@ Each clip card can now use its own LoRA.
 This makes it possible to change style, motion or behavior from one clip to another while keeping the Extender’s normal continuity workflow.
 
 ---
+
+## ⚡ New — Alibaba PDD Acc (8-step / 4-step)
+
+Optional **Parallel Decoding Distillation** acceleration via the official Alibaba Acc LoRAs.
+
+### Requirements
+
+1. Install the companion pack: [ComfyUI-MiniMax-H3-PDD-Acc](https://github.com/Jalen-Brunson/ComfyUI-MiniMax-H3-PDD-Acc)
+2. Download Acc LoRAs into `ComfyUI/models/pdd_acc/`:
+   - [alibaba-pai/MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs) (original), or
+   - [aptech0081/MiniMax-H3-Acc-LoRAs-ComfyUI](https://huggingface.co/aptech0081/MiniMax-H3-Acc-LoRAs-ComfyUI) (pre-converted ComfyUI keys)
+3. Pair **FL2VA Acc** with FL2VA mode / UNET, **Ref2VA Acc** with Ref2VA.
+
+### Extender controls
+
+| Widget | Default | Notes |
+|--------|---------|--------|
+| `pdd_acc_lora` | `None` | Acc file from `models/pdd_acc/`. `None` = normal `steps` + `scheduler`. |
+| `pdd_nfe` | `8` | `8` (trained) or `4` (official faster). |
+| `pdd_lora_strength` / `pdd_head_strength` | `1.0` | Trained at 1.0. |
+
+When a PDD file is selected:
+
+- the Extender uses the **trained PDD sigma grid** (`pdd_nfe`); the ordinary **steps** and **scheduler** widgets are hidden in the UI and ignored for sampling
+- recommend **sampler = euler** (warning only if you pick something else; controls stay editable)
+- CFG stays 1.0 via the Extender’s BasicGuider (unchanged)
+- **style / character LoRAs** on clip cards still stack on top of PDD
+- do **not** stack other turbo/distill LoRAs or step-cache nodes with PDD
+- mismatched FL2VA/Ref2VA Acc vs mode/UNET hard-errors
+
+Upstream SigmaShift should remain **12 / 3** as in normal H3 workflows.
+
+---
 ## 🎬 New — Video & Audio References for MiniMax H3
 
 The Extender now supports **MiniMax H3 video references** directly inside the workflow.
