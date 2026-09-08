@@ -182,7 +182,23 @@ const PLAYER_MIN_WIDTH = 380;
 const PLAYER_MIN_HEIGHT = 227;
 const LABEL_HEIGHT = 22;
 const PREVIEW_HEADER_GAP = 7;
+const CLIP_STRIP_HEIGHT = 26;
+const CLIP_STRIP_GAP = 6;
 const BOTTOM_PAD = 14;
+
+// Stable identity colors for clip segments (not Extender status borders).
+const CLIP_STRIP_PALETTE = [
+    "#3d8bfd",
+    "#5cb85c",
+    "#f0ad4e",
+    "#d9534f",
+    "#9b59b6",
+    "#1abc9c",
+    "#e67e22",
+    "#3498db",
+    "#e74c3c",
+    "#2ecc71",
+];
 
 function previewDomRenderMode(element) {
     const LG = globalThis.LiteGraph;
@@ -244,6 +260,180 @@ function syncPreviewColorFilter(state) {
     if (!state?.video) return;
     const adjustment = colorAdjustmentAtTime(state.colorTimeline, state.video.currentTime);
     state.video.style.filter = adjustment ? cssColorFilter(adjustment) : "none";
+}
+
+function clipStripColor(index) {
+    return CLIP_STRIP_PALETTE[Math.abs(Number(index) || 0) % CLIP_STRIP_PALETTE.length];
+}
+
+function timelineItemAtTime(timeline, time) {
+    const items = timeline || [];
+    if (!items.length) return null;
+    const t = Number(time || 0);
+    for (const item of items) {
+        const start = Number(item?.start || 0);
+        const end = Number(item?.end || start);
+        if (t >= start && t < end) return item;
+    }
+    const last = items[items.length - 1];
+    if (t >= Number(last?.start || 0)) return last;
+    return items[0];
+}
+
+function stripChromeHeight(state) {
+    return (state?.colorTimeline || []).length > 0
+        ? CLIP_STRIP_HEIGHT + CLIP_STRIP_GAP
+        : 0;
+}
+
+function effectivePlayerMinHeight(state) {
+    return PLAYER_MIN_HEIGHT + stripChromeHeight(state);
+}
+
+function videoChromePadding(state) {
+    return LABEL_HEIGHT + PREVIEW_HEADER_GAP + stripChromeHeight(state) + 4;
+}
+
+function upstreamClipNames(node) {
+    const origin = findUpstreamExtenderNode(node);
+    const runtimeClips = origin?.__h3Extender?.state?.clips;
+    if (Array.isArray(runtimeClips) && runtimeClips.length) {
+        return runtimeClips.map((clip) => String(clip?.name || "").trim());
+    }
+
+    const clipsWidget = (origin?.widgets || []).find((w) => w?.name === "clips_json");
+    if (typeof clipsWidget?.value === "string" && clipsWidget.value) {
+        try {
+            const parsed = JSON.parse(clipsWidget.value);
+            const clips = Array.isArray(parsed?.clips) ? parsed.clips : parsed;
+            if (Array.isArray(clips)) {
+                return clips.map((clip) => String(clip?.name || "").trim());
+            }
+        } catch (_) {}
+    }
+    return [];
+}
+
+function clipStripLabel(index, names) {
+    const name = String(names?.[index] || "").trim();
+    return name ? `Clip ${index + 1}: ${name}` : `Clip ${index + 1}`;
+}
+
+function formatPreviewLabel(state, activeItem) {
+    const base = String(state?.baseLabel || "FULL LIVE PREVIEW");
+    if (!activeItem) return base;
+    const index = Number(activeItem.index);
+    if (!Number.isFinite(index)) return base;
+    return `${base}  ·  ${clipStripLabel(index, state.clipNames)}`;
+}
+
+function syncClipStripActive(state) {
+    if (!state?.video) return;
+
+    const item = timelineItemAtTime(state.colorTimeline, state.video.currentTime);
+    const activeIndex = item == null ? -1 : Number(item.index);
+    if (state.stripActiveIndex !== activeIndex) {
+        state.stripActiveIndex = activeIndex;
+        for (const seg of state.stripSegments || []) {
+            const isActive = Number(seg.dataset.clipIndex) === activeIndex;
+            seg.style.outline = isActive ? "1px solid rgba(255,255,255,0.92)" : "1px solid transparent";
+            seg.style.filter = isActive ? "brightness(1.18)" : "none";
+            seg.style.zIndex = isActive ? "2" : "1";
+        }
+    }
+
+    if (state.label) {
+        const next = formatPreviewLabel(state, item);
+        if (state.label.textContent !== next) state.label.textContent = next;
+    }
+}
+
+function rebuildClipStrip(node, state) {
+    if (!state?.strip) return;
+
+    const timeline = Array.isArray(state.colorTimeline) ? state.colorTimeline : [];
+    state.clipNames = upstreamClipNames(node);
+    state.strip.innerHTML = "";
+    state.stripSegments = [];
+    state.stripActiveIndex = -1;
+
+    if (!timeline.length) {
+        state.strip.style.display = "none";
+        syncClipStripActive(state);
+        return;
+    }
+
+    state.strip.style.display = "flex";
+    const total = Math.max(
+        0.001,
+        timeline.reduce((sum, item) => {
+            const start = Number(item?.start || 0);
+            const end = Number(item?.end || start);
+            return sum + Math.max(0, end - start);
+        }, 0)
+    );
+
+    for (const item of timeline) {
+        const index = Number(item?.index || 0);
+        const start = Number(item?.start || 0);
+        const end = Number(item?.end || start);
+        const duration = Math.max(0, end - start);
+        const seg = document.createElement("button");
+        seg.type = "button";
+        seg.dataset.clipIndex = String(index);
+        seg.title = `${clipStripLabel(index, state.clipNames)}  (${start.toFixed(1)}s–${end.toFixed(1)}s)`;
+        seg.textContent = clipStripLabel(index, state.clipNames);
+        seg.style.flex = `${Math.max(duration / total, 0.04)} 1 0`;
+        seg.style.minWidth = "0";
+        seg.style.height = "100%";
+        seg.style.margin = "0";
+        seg.style.padding = "0 6px";
+        seg.style.border = "none";
+        seg.style.borderRight = "1px solid rgba(0,0,0,0.35)";
+        seg.style.outline = "1px solid transparent";
+        seg.style.borderRadius = "0";
+        seg.style.background = clipStripColor(index);
+        seg.style.color = "#fff";
+        seg.style.fontSize = "10px";
+        seg.style.fontWeight = "700";
+        seg.style.letterSpacing = "0.2px";
+        seg.style.lineHeight = `${CLIP_STRIP_HEIGHT}px`;
+        seg.style.whiteSpace = "nowrap";
+        seg.style.overflow = "hidden";
+        seg.style.textOverflow = "ellipsis";
+        seg.style.cursor = "pointer";
+        seg.style.textShadow = "0 1px 2px rgba(0,0,0,0.65)";
+        seg.style.opacity = "0.92";
+
+        seg.addEventListener("click", (event) => {
+            if (!state.video) return;
+            const rect = seg.getBoundingClientRect();
+            const width = Math.max(1, rect.width);
+            const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / width));
+            const target = start + ratio * Math.max(0, end - start);
+            const durationLimit = Number(state.video.duration);
+            const clamped = Number.isFinite(durationLimit) && durationLimit > 0
+                ? Math.min(Math.max(0, target), Math.max(0, durationLimit - 0.001))
+                : Math.max(0, target);
+            try {
+                state.video.currentTime = clamped;
+            } catch (_) {}
+            syncClipStripActive(state);
+            syncPreviewColorFilter(state);
+        });
+
+        state.strip.appendChild(seg);
+        state.stripSegments.push(seg);
+    }
+
+    syncClipStripActive(state);
+}
+
+function setPreviewTimeline(node, state, timeline, baseLabel = null) {
+    if (!state) return;
+    if (baseLabel != null) state.baseLabel = String(baseLabel);
+    state.colorTimeline = Array.isArray(timeline) ? timeline : [];
+    rebuildClipStrip(node, state);
 }
 
 
@@ -402,7 +592,7 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
 
         const clips = Number(payload.clip_count || 0);
         const frames = Number(payload.frame_count || 0);
-        state.label.textContent =
+        const baseLabel =
             `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
 
         state.currentVideoInfo = { ...payload.video };
@@ -412,10 +602,17 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
             mode: "restored",
         };
         state.currentFps = Number(payload.video?.frame_rate || state.currentFps || 24);
-        state.colorTimeline = Array.isArray(payload.color_timeline) ? payload.color_timeline : [];
+        setPreviewTimeline(node, state, payload.color_timeline, baseLabel);
         state.saveButton.disabled = false;
         loadPreviewSource(node, state, mediaUrl(payload.video) + "&t=" + Date.now());
         state.restoreLoaded = true;
+
+        // Extender clip names can finish restoring a tick after Final Decode.
+        setTimeout(() => {
+            if (state.liveLoaded) return;
+            rebuildClipStrip(node, state);
+            syncPlayerToNode(node, state, true);
+        }, 250);
 
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
@@ -445,9 +642,10 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
     if (mode === "nodes2") {
         const currentH = Number(node.size?.[1] || 0);
         const widgetY = Number(state.widget.last_y);
+        const minH = effectivePlayerMinHeight(state);
         const fallbackH = Number.isFinite(widgetY) && widgetY > 0
-            ? widgetY + PLAYER_MIN_HEIGHT + BOTTOM_PAD
-            : PLAYER_MIN_HEIGHT + 180;
+            ? widgetY + minH + BOTTOM_PAD
+            : minH + 180;
 
         // Recover a node that was already poisoned by the old resize feedback
         // loop, but otherwise never write Vue's allocated height back to size.
@@ -481,12 +679,12 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
         // the row collapse until WidgetDOM remounts on page refresh. Preserve an
         // intrinsic minimum and let Vue stretch the player naturally.
         state.box.style.height = "auto";
-        state.box.style.minHeight = `${PLAYER_MIN_HEIGHT}px`;
+        state.box.style.minHeight = `${minH}px`;
         state.box.style.maxHeight = "none";
         state.box.style.flex = "1 1 auto";
         state.box.style.overflow = "visible";
         state.video.style.height = "auto";
-        state.video.style.minHeight = `${Math.max(80, PLAYER_MIN_HEIGHT - LABEL_HEIGHT - PREVIEW_HEADER_GAP - 4)}px`;
+        state.video.style.minHeight = `${Math.max(80, minH - videoChromePadding(state))}px`;
         state.video.style.flex = "1 1 auto";
         return;
     }
@@ -518,7 +716,8 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
             Number(node.size?.[0] || PLAYER_MIN_WIDTH)
         );
         let nodeH = Number(node.size?.[1] || 0);
-        const minimumNodeH = widgetY + PLAYER_MIN_HEIGHT + BOTTOM_PAD;
+        const minH = effectivePlayerMinHeight(state);
+        const minimumNodeH = widgetY + minH + BOTTOM_PAD;
         const returningFromNodes2 = state.lastRenderMode === "nodes2";
 
         if (returningFromNodes2) {
@@ -547,7 +746,7 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
 
         const actualH = Number(node.size?.[1] || nodeH);
         const availableH = Math.max(
-            PLAYER_MIN_HEIGHT,
+            minH,
             actualH - widgetY - BOTTOM_PAD
         );
 
@@ -558,7 +757,7 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
         state.lastRenderMode = "legacy";
         state.box.style.height = `${availableH}px`;
         state.video.style.height =
-            `${Math.max(80, availableH - LABEL_HEIGHT - PREVIEW_HEADER_GAP - 4)}px`;
+            `${Math.max(80, availableH - videoChromePadding(state))}px`;
         node.graph?.setDirtyCanvas(true, true);
     } finally {
         state.syncingPlayer = false;
@@ -694,8 +893,22 @@ function makePlayer(node) {
     video.style.background = "#000";
     video.style.borderRadius = "4px";
 
+    const strip = document.createElement("div");
+    strip.style.display = "none";
+    strip.style.width = "100%";
+    strip.style.height = `${CLIP_STRIP_HEIGHT}px`;
+    strip.style.minHeight = `${CLIP_STRIP_HEIGHT}px`;
+    strip.style.marginTop = `${CLIP_STRIP_GAP}px`;
+    strip.style.boxSizing = "border-box";
+    strip.style.borderRadius = "4px";
+    strip.style.overflow = "hidden";
+    strip.style.background = "rgba(0,0,0,0.35)";
+    strip.style.border = "1px solid rgba(255,255,255,0.12)";
+    strip.title = "Clip timeline — click a segment to seek";
+
     box.appendChild(header);
     box.appendChild(video);
+    box.appendChild(strip);
 
     const state = {
         box,
@@ -703,11 +916,16 @@ function makePlayer(node) {
         label,
         saveButton,
         video,
+        strip,
+        stripSegments: [],
+        stripActiveIndex: -1,
         widget: null,
         currentVideoInfo: null,
         currentPreviewMeta: null,
         currentFps: 24,
         colorTimeline: [],
+        clipNames: [],
+        baseLabel: "FULL LIVE PREVIEW",
         saveInProgress: false,
         currentHeight: PLAYER_MIN_HEIGHT,
         syncingPlayer: false,
@@ -718,13 +936,17 @@ function makePlayer(node) {
         restoreRequestRunning: false,
     };
 
-    video.addEventListener("timeupdate", () => syncPreviewColorFilter(state));
-    video.addEventListener("seeked", () => syncPreviewColorFilter(state));
-    video.addEventListener("loadedmetadata", () => syncPreviewColorFilter(state));
+    const onPlaybackTick = () => {
+        syncPreviewColorFilter(state);
+        syncClipStripActive(state);
+    };
+    video.addEventListener("timeupdate", onPlaybackTick);
+    video.addEventListener("seeked", onPlaybackTick);
+    video.addEventListener("loadedmetadata", onPlaybackTick);
     if (typeof video.requestVideoFrameCallback === "function") {
         const colorFrameTick = () => {
             if (!box.isConnected) return;
-            syncPreviewColorFilter(state);
+            onPlaybackTick();
             video.requestVideoFrameCallback(colorFrameTick);
         };
         video.requestVideoFrameCallback(colorFrameTick);
@@ -733,20 +955,21 @@ function makePlayer(node) {
     const widget = node.addDOMWidget("h3_live_preview", "preview", box, {
         serialize: false,
         hideOnZoom: false,
-        getMinHeight: () => PLAYER_MIN_HEIGHT,
+        getMinHeight: () => effectivePlayerMinHeight(state),
         getHeight: () => state.currentHeight,
         afterResize: (resizedNode) => {
             const mode = previewDomRenderMode(box);
             if (mode === "nodes2") {
                 // Current WidgetDOM.vue already stretches its child. Keep only
                 // an intrinsic minimum; never write a percentage height back.
+                const minH = effectivePlayerMinHeight(state);
                 box.style.height = "auto";
-                box.style.minHeight = `${PLAYER_MIN_HEIGHT}px`;
+                box.style.minHeight = `${minH}px`;
                 box.style.maxHeight = "none";
                 box.style.flex = "1 1 auto";
                 box.style.overflow = "visible";
                 video.style.height = "auto";
-                video.style.minHeight = `${Math.max(80, PLAYER_MIN_HEIGHT - LABEL_HEIGHT - PREVIEW_HEADER_GAP - 4)}px`;
+                video.style.minHeight = `${Math.max(80, minH - videoChromePadding(state))}px`;
                 video.style.flex = "1 1 auto";
                 state.lastRenderMode = "nodes2";
             } else {
@@ -796,10 +1019,14 @@ function refreshImportedProjectPreview(ownerId) {
         state.restoreRequestRunning = false;
         state.currentVideoInfo = null;
         state.currentPreviewMeta = null;
-        state.colorTimeline = [];
+        setPreviewTimeline(
+            node,
+            state,
+            [],
+            "PROJECT LOADED — preview will restore when cached render data is available"
+        );
         state.video.style.filter = "none";
         state.saveButton.disabled = true;
-        state.label.textContent = "PROJECT LOADED — preview will restore when cached render data is available";
         try {
             state.video.pause();
             state.video.removeAttribute("src");
@@ -827,8 +1054,9 @@ app.registerExtension({
                 if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
                 if (String(findUpstreamExtenderId(node)) !== String(ownerId)) continue;
                 const state = makePlayer(node);
-                state.colorTimeline = timeline;
+                setPreviewTimeline(node, state, timeline);
                 syncPreviewColorFilter(state);
+                syncPlayerToNode(node, state, true);
             }
         });
     },
@@ -910,15 +1138,14 @@ app.registerExtension({
             state.liveLoaded = true;
             const meta = message?.h3_preview_info?.[0];
 
+            let baseLabel = "FULL LIVE PREVIEW";
             if (meta?.mode === "clip_by_clip") {
                 const s = Number(meta.seam_shift || 0);
-                state.label.textContent =
+                baseLabel =
                     `FULL LIVE PREVIEW — ${meta.total_clips} clip${meta.total_clips > 1 ? "s" : ""} — shift ${s >= 0 ? "+" : ""}${s}`;
             } else if (meta?.mode === "full_batch") {
-                state.label.textContent =
+                baseLabel =
                     `FINAL PREVIEW — ${meta.total_clips} clips (${meta.preview_frames} frames)`;
-            } else {
-                state.label.textContent = "FULL LIVE PREVIEW";
             }
 
             state.currentVideoInfo = { ...info };
@@ -928,7 +1155,7 @@ app.registerExtension({
                 mode: String(meta?.mode || ""),
             };
             state.currentFps = Number(info.frame_rate || state.currentFps || 24);
-            state.colorTimeline = Array.isArray(meta?.color_timeline) ? meta.color_timeline : [];
+            setPreviewTimeline(this, state, meta?.color_timeline, baseLabel);
             state.saveButton.disabled = false;
             loadPreviewSource(this, state, mediaUrl(info) + "&t=" + Date.now());
 
