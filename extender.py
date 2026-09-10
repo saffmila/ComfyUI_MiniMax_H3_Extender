@@ -58,6 +58,7 @@ from .motion_context_disk import (
     CACHE_TYPE,
     _DATA_START,
     _chain_paths,
+    _clear_refine_sidecar,
     _decoded_audio_cache_path,
     _decoded_audio_cache_end,
     _decoded_preview_cache_path,
@@ -93,7 +94,7 @@ from .fl2va_engine import (
     install_fl2va_project_continuity,
 )
 
-BUILD = "minimax-h3-extender-v2.1.0-pdd"
+BUILD = "minimax-h3-extender-v2.2.0-latent-refine"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -2902,6 +2903,12 @@ class MiniMaxH3Extender:
         default_sampler = "euler" if "euler" in sampler_names else sampler_names[0]
         default_scheduler = "simple" if "simple" in scheduler_names else scheduler_names[0]
 
+        try:
+            from .latent_upscaler import scan_upscale_models
+            _upscale_models = scan_upscale_models()
+        except Exception:
+            _upscale_models = ["None"]
+
         required = {
             "model": (
                 "MODEL",
@@ -2948,14 +2955,14 @@ class MiniMaxH3Extender:
                 ["auto_from_ref", "manual"],
                 {
                     "default": "auto_from_ref",
-                    "tooltip": "Auto uses internal Ref 1 as the aspect-ratio guide; with no internal image references it falls back to width/height.",
+                    "tooltip": "Canvas size mode. Auto keeps aspect from the reference and scales to megapixels; Manual uses width/height. With no usable reference Auto falls back to width/height.",
                 },
             ),
             "megapixels": (
                 "FLOAT",
                 {
                     "default": DEFAULT_MEGAPIXELS, "min": 0.01, "max": 16.0, "step": 0.01,
-                    "tooltip": "Target total pixels for Auto resolution. Auto and Manual canvases use the MiniMax H3 32-pixel grid; Auto snaps downward without exceeding the requested pixel budget.",
+                    "tooltip": "Target total pixels for Auto canvas size. Auto and Manual canvases use the MiniMax H3 32-pixel grid; Auto snaps downward without exceeding the requested pixel budget.",
                 },
             ),
             # Internal image-reference manager state. Appended after the v14.25
@@ -3008,6 +3015,58 @@ class MiniMaxH3Extender:
                     "max": 2.0,
                     "step": 0.01,
                     "tooltip": "PDD head-bank blend strength (trained at 1.0). Ignored when pdd_acc_lora is None.",
+                },
+            ),
+            # Latent refine (appended for workflow widget compatibility).
+            "run_refine": (
+                "BOOLEAN",
+                {
+                    "default": False,
+                    "tooltip": "When True, keep the draft cache and run a second pass: neural latent upscale + resample with refine_denoise. Requires a complete draft and latent_upscale_model.",
+                },
+            ),
+            "latent_upscale_model": (
+                _upscale_models,
+                {
+                    "default": "None",
+                    "tooltip": "H3 latent upscaler weights from models/latent_upscale_models/. Used by run_refine.",
+                },
+            ),
+            "refine_megapixels": (
+                "FLOAT",
+                {
+                    "default": 1.0,
+                    "min": 0.1,
+                    "max": 8.0,
+                    "step": 0.1,
+                    "tooltip": "Target megapixels for the refine pass after latent upscale.",
+                },
+            ),
+            "refine_denoise": (
+                "FLOAT",
+                {
+                    "default": 0.3,
+                    "min": 0.01,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Sampler denoise for the refine pass (img2img on upscaled draft latents).",
+                },
+            ),
+            "refine_steps": (
+                "INT",
+                {
+                    "default": 4,
+                    "min": 1,
+                    "max": 10000,
+                    "step": 1,
+                    "tooltip": "Sampler steps for the refine pass.",
+                },
+            ),
+            "latent_upscale_precision": (
+                ["fp16", "bf16", "fp32"],
+                {
+                    "default": "fp16",
+                    "tooltip": "Compute precision for the latent upscaler during refine.",
                 },
             ),
         }
@@ -3564,6 +3623,12 @@ class MiniMaxH3Extender:
         pdd_nfe="8",
         pdd_lora_strength=1.0,
         pdd_head_strength=1.0,
+        run_refine=False,
+        latent_upscale_model="None",
+        refine_megapixels=1.0,
+        refine_denoise=0.3,
+        refine_steps=4,
+        latent_upscale_precision="fp16",
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -3583,6 +3648,11 @@ class MiniMaxH3Extender:
         owner = str(unique_id if unique_id is not None else "h3_extender")
         if external_prompt_pack is None:
             active_prompt_pack_signature = ""
+
+        if bool(run_refine) and generation_mode == "fl2va":
+            raise ValueError(
+                "MiniMax H3 Extender: run_refine is currently supported for REF2VA only."
+            )
 
         if generation_mode == "fl2va":
             return self._extend_fl2va(
@@ -3770,6 +3840,86 @@ class MiniMaxH3Extender:
         generated = []
         statuses = []
 
+        if bool(run_refine):
+            from .latent_refine import run_refine_pass
+
+            current_manifest = _load_manifest_from_paths(data_path, manifest_path)
+            if current_manifest is None:
+                raise ValueError(
+                    "MiniMax H3 Extender: run_refine needs an existing draft cache."
+                )
+            run_refine_pass(
+                owner=owner,
+                data_path=data_path,
+                draft_manifest=current_manifest,
+                clips=clips,
+                model=model,
+                clip=clip,
+                vae=vae,
+                audio_vae=audio_vae,
+                refs=refs,
+                ref_videos=ref_videos,
+                ref_video_fps=ref_video_fps,
+                ref_video_audios=ref_video_audios,
+                standalone_audio_clip_plan=standalone_audio_clip_plan,
+                active_ref_video_count=active_ref_video_count,
+                prepared_image_blocks=prepared_image_blocks,
+                prepared_video_blocks_by_frame_count=prepared_video_blocks_by_frame_count,
+                ref_image_size=ref_image_size,
+                context_length=context_length,
+                audio_context_length=audio_context_length,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                upscale_model=latent_upscale_model,
+                refine_megapixels=refine_megapixels,
+                refine_denoise=refine_denoise,
+                refine_steps=refine_steps,
+                upscale_precision=latent_upscale_precision,
+                make_ref2va_conditioning=_make_ref2va_conditioning,
+                prepare_shared_refs=_prepare_shared_refs,
+                prepare_standalone_audio_refs=_prepare_standalone_audio_refs,
+                apply_per_clip_loras=_apply_per_clip_loras,
+                sample_h3=_sample_h3,
+                motion=motion,
+                duration_to_frames=_duration_to_frames,
+                reference_count=_reference_count,
+                max_mixed_ref_items=MAX_MIXED_REF_ITEMS,
+                fps=FPS,
+                send_progress=_send_extender_progress,
+                extender_self=self,
+            )
+            # Draft cache handle; Final Decode latent_layer=auto picks refine sidecar.
+            status = f"refined {len(clips)} clip(s) | draft preserved"
+            previous_handle = {
+                "version": CACHE_VERSION,
+                "data_path": str(Path(data_path).resolve()),
+                "manifest_path": str(Path(manifest_path).resolve()),
+                "run_mode": str(run_mode),
+                "stop": True,
+                "next_index": int(len(current_manifest.get("segments", []))),
+                "status": status,
+            }
+            size = _cache_size_mb(data_path, manifest_path)
+            validated_count = sum(1 for c in clips if c.get("validated"))
+            _send_extender_progress(owner, -1, len(clips), "idle", status)
+            ui_state = {
+                "clips_json": _state_json(clips),
+                "status": status,
+                "build": BUILD,
+                "refined": True,
+            }
+            return {
+                "ui": {"h3_extender_state": [ui_state]},
+                "result": (
+                    previous_handle,
+                    int(len(clips)),
+                    int(validated_count),
+                    status,
+                    float(size),
+                    BUILD,
+                ),
+            }
+
         # Walk the card list in order. Cached TRUE clips are metadata-only;
         # active clips sample and are written immediately to disk.
         for i, cfg in enumerate(clips):
@@ -3932,6 +4082,9 @@ class MiniMaxH3Extender:
                 "sampling",
                 f"Rendering clip {i + 1}/{len(clips)}",
             )
+
+            # Draft rewrite invalidates any previous refine sidecar.
+            _clear_refine_sidecar(data_path)
 
             sampled = _sample_h3(
                 clip_model,

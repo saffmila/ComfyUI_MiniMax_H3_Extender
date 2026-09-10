@@ -92,6 +92,41 @@ function hideCompatibilityWidget(node, name) {
     node?.graph?.setDirtyCanvas(true, true);
 }
 
+function ensureLatentUpscaleWidgetDefaults(node) {
+    // Newly appended Final Decode combos are '' in older workflow JSON until
+    // the user touches them. Coerce to safe defaults so prompt validation passes.
+    const layer = getWidget(node, "latent_layer");
+    if (layer && (layer.value === "" || layer.value == null)) {
+        layer.value = "auto";
+    }
+    const model = getWidget(node, "latent_upscale_model");
+    if (model && (model.value === "" || model.value == null)) {
+        model.value = "None";
+    }
+    const precision = getWidget(node, "latent_upscale_precision");
+    if (precision && (precision.value === "" || precision.value == null)) {
+        precision.value = "fp16";
+    }
+    const mp = getWidget(node, "latent_upscale_megapixels");
+    if (mp && (mp.value === "" || mp.value == null || Number.isNaN(Number(mp.value)))) {
+        mp.value = 1.0;
+    }
+}
+
+function hideFinalDecodeGenerationWidgets(node) {
+    // Generation / layer controls live on the Extender (Latent refine section).
+    // Final Decode keeps the values for serialization + decode, but the player UI
+    // should stay play-only.
+    for (const name of [
+        "latent_layer",
+        "latent_upscale_model",
+        "latent_upscale_megapixels",
+        "latent_upscale_precision",
+    ]) {
+        hideCompatibilityWidget(node, name);
+    }
+}
+
 function isFalseValue(value) {
     return value === false || value === 0 || value === "false";
 }
@@ -1094,12 +1129,16 @@ app.registerExtension({
 
             stripFinalDecodeOutputs(this);
             hideCompatibilityWidget(this, "fps");
+            ensureLatentUpscaleWidgetDefaults(this);
+            hideFinalDecodeGenerationWidgets(this);
             const state = makePlayer(this);
 
             requestAnimationFrame(() => {
                 requestAnimationFrame(() => {
                     stripFinalDecodeOutputs(this);
                     hideCompatibilityWidget(this, "fps");
+                    ensureLatentUpscaleWidgetDefaults(this);
+                    hideFinalDecodeGenerationWidgets(this);
                     syncPlayerToNode(this, state, true);
                     restorePreviewOnLoad(this, state);
                 });
@@ -1118,10 +1157,14 @@ app.registerExtension({
 
             stripFinalDecodeOutputs(this);
             hideCompatibilityWidget(this, "fps");
+            ensureLatentUpscaleWidgetDefaults(this);
+            hideFinalDecodeGenerationWidgets(this);
             const state = makePlayer(this);
             requestAnimationFrame(() => {
                 stripFinalDecodeOutputs(this);
                 hideCompatibilityWidget(this, "fps");
+                ensureLatentUpscaleWidgetDefaults(this);
+                hideFinalDecodeGenerationWidgets(this);
                 restorePreviewOnLoad(this, state);
             });
             return r;

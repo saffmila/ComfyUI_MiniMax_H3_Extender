@@ -148,6 +148,10 @@ class _FinalDecodeNativeProgress:
 CACHE_TYPE = "H3_MOTION_DISK_CACHE"
 _LOG = logging.getLogger("minimax_h3_tail_from_latent.motion_context_disk")
 
+# Set for the duration of one Final Decode export so every video-load path
+# can optionally neural-upscale draft latents before VAE decode.
+_ACTIVE_UPSCALE_CTX = None
+
 _NODE_DIR = Path(__file__).resolve().parent
 _CACHE_ROOT = _NODE_DIR / "cache"
 _DATA_MAGIC = b"H3MCACHE12\x00"
@@ -191,6 +195,160 @@ def _chain_paths(owner_id):
     root = _ensure_cache_root()
     stem = "chain_" + _safe_name(owner_id)
     return root / f"{stem}.h3cache", root / f"{stem}.json"
+
+
+def _refine_paths_from_draft(data_path):
+    """Sidecar refine cache next to the draft ``.h3cache`` (draft stays intact)."""
+    data_path = Path(data_path)
+    stem = data_path.stem
+    return (
+        data_path.with_name(stem + ".refine.h3cache"),
+        data_path.with_name(stem + ".refine.json"),
+    )
+
+
+def _refine_sidecar_media_paths(refine_data_path):
+    """Decoded preview/audio caches that sit next to ``*.refine.h3cache``."""
+    refine_data_path = Path(refine_data_path)
+    return (
+        _decoded_preview_cache_path(refine_data_path),
+        _decoded_preview_video_cache_path(refine_data_path),
+        _decoded_audio_cache_path(refine_data_path),
+    )
+
+
+def _clear_refine_sidecar(data_path):
+    refine_data, refine_manifest = _refine_paths_from_draft(data_path)
+    preview, preview_video, audio = _refine_sidecar_media_paths(refine_data)
+    for path in (refine_data, refine_manifest, preview, preview_video, audio):
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _refine_preview_cache_ready(manifest, data_path):
+    """True when a full decoded refine preview can be shown without VAE."""
+    if not isinstance(manifest, dict):
+        return False
+    segments = manifest.get("segments") or []
+    if not segments:
+        return False
+    committed = _decoded_preview_cache_path(data_path)
+    if not committed.exists() or committed.stat().st_size < 64:
+        return False
+    if int(manifest.get("preview_committed_count", 0)) < len(segments):
+        return False
+    if str(manifest.get("preview_audio_mode", "")) != PREVIEW_AUDIO_MODE:
+        return False
+    return True
+
+
+def _persist_layer_preview_cache(
+    data_path,
+    manifest_path,
+    manifest,
+    source_mp4,
+    source_video_mp4=None,
+):
+    """Store a muxed full preview next to the latent cache (draft or refine)."""
+    data_path = Path(data_path)
+    manifest_path = Path(manifest_path)
+    source = Path(source_mp4).resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"H3 preview cache: source missing: {source}")
+
+    committed = _decoded_preview_cache_path(data_path)
+    committed_video = _decoded_preview_video_cache_path(data_path)
+    committed.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = committed.with_name(f".{committed.name}.{uuid.uuid4().hex[:10]}.tmp")
+    try:
+        shutil.copy2(source, tmp)
+        os.replace(tmp, committed)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    if source_video_mp4 is not None:
+        video_src = Path(source_video_mp4)
+        if video_src.exists():
+            tmp_v = committed_video.with_name(
+                f".{committed_video.name}.{uuid.uuid4().hex[:10]}.tmp"
+            )
+            try:
+                shutil.copy2(video_src, tmp_v)
+                os.replace(tmp_v, committed_video)
+            finally:
+                if tmp_v.exists():
+                    try:
+                        tmp_v.unlink()
+                    except OSError:
+                        pass
+
+    updated = dict(manifest or {})
+    segs = list(updated.get("segments") or [])
+    updated["preview_committed_count"] = int(len(segs))
+    updated["preview_audio_mode"] = PREVIEW_AUDIO_MODE
+    updated["preview_portable_full"] = True
+    updated["build"] = BUILD
+    updated["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, updated)
+    _LOG.info(
+        "H3 preview cache saved: %s (%d clips)",
+        committed.name,
+        len(segs),
+    )
+    return updated, committed
+
+
+def _refine_manifest_available(data_path, draft_manifest):
+    refine_data, refine_manifest_path = _refine_paths_from_draft(data_path)
+    if not refine_data.exists() or not refine_manifest_path.exists():
+        return None
+    try:
+        refine_manifest = json.loads(
+            refine_manifest_path.read_text(encoding="utf-8")
+        )
+    except Exception:
+        return None
+    draft_segments = draft_manifest.get("segments", []) if isinstance(draft_manifest, dict) else []
+    refine_segments = refine_manifest.get("segments", []) if isinstance(refine_manifest, dict) else []
+    if not refine_segments or len(refine_segments) != len(draft_segments):
+        return None
+    return refine_data, refine_manifest_path, refine_manifest
+
+
+def _select_latent_layer(data_path, manifest_path, manifest, latent_layer="auto"):
+    """Pick draft or refine cache. ``auto`` prefers a complete refine sidecar."""
+    layer = str(latent_layer or "auto").strip().lower()
+    if layer not in ("auto", "draft", "refine"):
+        layer = "auto"
+
+    if layer == "draft":
+        return data_path, manifest_path, manifest, "draft"
+
+    refine = _refine_manifest_available(data_path, manifest)
+    if layer == "refine":
+        if refine is None:
+            # Common after a fresh draft rewrite: run_refine sidecar was cleared.
+            # Fall back to draft instead of failing the whole Final Decode queue.
+            _LOG.warning(
+                "Disk Final Decode: latent_layer=refine but no complete refine "
+                "cache was found; falling back to draft. Re-run Extender with "
+                "run_refine=True to rebuild the refine sidecar."
+            )
+            return data_path, manifest_path, manifest, "draft"
+        return refine[0], refine[1], refine[2], "refine"
+
+    # auto
+    if refine is not None:
+        return refine[0], refine[1], refine[2], "refine"
+    return data_path, manifest_path, manifest, "draft"
 
 
 def _decoded_audio_cache_path(data_path):
@@ -439,6 +597,20 @@ def _load_segment_video(data_path, desc):
     if video.ndim != 5 or int(video.shape[0]) != 1:
         raise ValueError(f"Invalid cached H3 video shape: {tuple(video.shape)}")
     return video
+
+
+def _maybe_upscale_segment_video(video, upscale_ctx=None):
+    """Optional H3 video-latent neural upscale; audio must stay untouched.
+
+    When ``upscale_ctx`` is omitted, uses the Final Decode active context so
+    progressive/full-batch paths pick up the same settings without signature churn.
+    """
+    ctx = _ACTIVE_UPSCALE_CTX if upscale_ctx is None else upscale_ctx
+    if not ctx:
+        return video
+    from .latent_upscaler import upscale_video_latent
+
+    return upscale_video_latent(video, **ctx)
 
 
 def _load_segment_audio(data_path, desc):
@@ -826,9 +998,13 @@ class MiniMaxH3MotionContextDiskJoin:
 # -----------------------------------------------------------------------------
 
 
-def _build_pair_video(data_path, prev_desc, curr_desc):
-    prev_v = _load_segment_video(data_path, prev_desc)
-    next_v = _load_segment_video(data_path, curr_desc)
+def _build_pair_video(data_path, prev_desc, curr_desc, upscale_ctx=None):
+    prev_v = _maybe_upscale_segment_video(
+        _load_segment_video(data_path, prev_desc), upscale_ctx
+    )
+    next_v = _maybe_upscale_segment_video(
+        _load_segment_video(data_path, curr_desc), upscale_ctx
+    )
 
     if tuple(prev_v.shape[:2]) != tuple(next_v.shape[:2]) or tuple(prev_v.shape[3:]) != tuple(next_v.shape[3:]):
         raise ValueError("Disk Final Decode: video latent geometry mismatch.")
@@ -2249,12 +2425,15 @@ def _render_one_final_video_segment(
     index,
     vae,
     progress=None,
+    upscale_ctx=None,
 ):
     i = int(index)
     curr = segments[i]
 
     if i == 0:
-        v = _load_segment_video(data_path, curr)
+        v = _maybe_upscale_segment_video(
+            _load_segment_video(data_path, curr), upscale_ctx
+        )
         video = vae.decode(v)
         if progress is not None:
             progress.advance()
@@ -2272,7 +2451,7 @@ def _render_one_final_video_segment(
         return video, 0
 
     prev = segments[i - 1]
-    chain, meta = _build_pair_video(data_path, prev, curr)
+    chain, meta = _build_pair_video(data_path, prev, curr, upscale_ctx=upscale_ctx)
     decoded, previous_raw, current_raw, shift = _decode_pair_video(
         vae, chain, meta
     )
@@ -2731,6 +2910,29 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
     if not segments:
         return None
 
+    # Prefer a complete refine decoded preview when present (same rule as
+    # Final Decode latent_layer=auto). Latents stay in *.refine.h3cache; this
+    # only republishes the already-decoded MP4 without touching the VAE.
+    refine = _refine_manifest_available(data_path, manifest)
+    if refine is not None:
+        refine_data, _refine_manifest_path, refine_manifest = refine
+        if _refine_preview_cache_ready(refine_manifest, refine_data):
+            refine_segments = [dict(x) for x in refine_manifest.get("segments", [])]
+            refine_committed = _decoded_preview_cache_path(refine_data)
+            preview_path = _reserve_preview_temp_path(final_id)
+            try:
+                os.link(refine_committed, preview_path)
+            except Exception:
+                shutil.copy2(refine_committed, preview_path)
+            return {
+                "path": preview_path,
+                "clip_count": int(len(refine_segments)),
+                "frame_count": int(refine_manifest.get("final_frame_count", 0)),
+                "fps": float(refine_manifest.get("fps", manifest.get("fps", FPS))),
+                "cache_mode": "committed_refine_preview",
+                "segments": refine_segments,
+            }
+
     preview_path = None
     committed_path = _decoded_preview_cache_path(data_path)
     committed_video_path = _decoded_preview_video_cache_path(data_path)
@@ -2755,6 +2957,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
             "frame_count": int(manifest.get("final_frame_count", 0)),
             "fps": float(manifest.get("fps", FPS)),
             "cache_mode": "committed_preview",
+            "segments": segments,
         }
 
     # Otherwise rebuild the full current preview from the per-clip decoded video
@@ -3061,8 +3264,11 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 cache_owner = f"extender_{_safe_name(owner_id)}"
             data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
+            color_segments = restored.get("segments")
+            if not color_segments:
+                color_segments = manifest.get("segments", []) if manifest else []
             color_timeline = _color_timeline(
-                manifest.get("segments", []) if manifest else [],
+                color_segments,
                 float(manifest.get("fps", FPS)) if manifest else FPS,
             )
             return web.json_response({
@@ -3085,6 +3291,11 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
 class MiniMaxH3MotionContextDiskFinalDecode:
     @classmethod
     def INPUT_TYPES(cls):
+        try:
+            from .latent_upscaler import scan_upscale_models
+            upscale_models = scan_upscale_models()
+        except Exception:
+            upscale_models = ["None"]
         return {
             "required": {
                 "cache": (CACHE_TYPE,),
@@ -3101,6 +3312,35 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], {"default": "fast"}),
                 "audio_bitrate": (["128k", "192k", "256k", "320k"], {"default": "192k"}),
                 "autoplay": ("BOOLEAN", {"default": True, "tooltip": "Auto-play the video preview when generating finishes or the node is loaded."}),
+                # Appended so old positional workflow widget arrays keep mapping.
+                "latent_layer": (
+                    ["auto", "draft", "refine"],
+                    {
+                        "default": "auto",
+                        "tooltip": "auto uses a complete refine sidecar when present, otherwise draft. Refine never deletes draft.",
+                    },
+                ),
+                "latent_upscale_model": (
+                    upscale_models,
+                    {
+                        "default": "None",
+                        "tooltip": "Optional neural upscale of video latents right before VAE decode. Audio untouched. Skipped automatically when decoding refine.",
+                    },
+                ),
+                "latent_upscale_megapixels": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.1,
+                        "max": 8.0,
+                        "step": 0.1,
+                        "tooltip": "Target megapixels for decode-time latent upscale.",
+                    },
+                ),
+                "latent_upscale_precision": (
+                    ["fp16", "bf16", "fp32"],
+                    {"default": "fp16"},
+                ),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -3110,6 +3350,25 @@ class MiniMaxH3MotionContextDiskFinalDecode:
     FUNCTION = "export"
     CATEGORY = "MiniMax H3"
     OUTPUT_NODE = True
+
+    @classmethod
+    def VALIDATE_INPUTS(
+        cls,
+        latent_layer=None,
+        latent_upscale_model=None,
+        latent_upscale_precision=None,
+        **_kwargs,
+    ):
+        # Old workflows serialize '' for newly appended combos. Accept and let
+        # export() coerce to defaults so legacy graphs keep running.
+        if latent_layer not in (None, "", "auto", "draft", "refine"):
+            return f"latent_layer must be auto/draft/refine, got {latent_layer!r}"
+        if latent_upscale_precision not in (None, "", "fp16", "bf16", "fp32"):
+            return (
+                "latent_upscale_precision must be fp16/bf16/fp32, "
+                f"got {latent_upscale_precision!r}"
+            )
+        return True
 
     def export(
         self,
@@ -3124,9 +3383,88 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         preset,
         audio_bitrate,
         autoplay=True,
+        latent_layer="auto",
+        latent_upscale_model="None",
+        latent_upscale_megapixels=1.0,
+        latent_upscale_precision="fp16",
         unique_id=None,
     ):
+        global _ACTIVE_UPSCALE_CTX
+        if str(latent_layer or "").strip() == "":
+            latent_layer = "auto"
+        if str(latent_upscale_model or "").strip() == "":
+            latent_upscale_model = "None"
+        if str(latent_upscale_precision or "").strip() == "":
+            latent_upscale_precision = "fp16"
         data_path, manifest_path, manifest = _load_manifest(cache)
+        data_path, manifest_path, manifest, selected_layer = _select_latent_layer(
+            data_path, manifest_path, manifest, latent_layer
+        )
+        _LOG.info("Disk Final Decode latent_layer=%s", selected_layer)
+
+        upscale_name = str(latent_upscale_model or "None")
+        if upscale_name not in ("", "None") and selected_layer == "refine":
+            upscale_name = "None"
+        if upscale_name not in ("", "None"):
+            _ACTIVE_UPSCALE_CTX = {
+                "model_name": upscale_name,
+                "megapixels": float(latent_upscale_megapixels),
+                "align": 32,
+                "device": "cuda",
+                "precision": str(latent_upscale_precision),
+                "enable_temporal_chunking": True,
+                "force_unload": True,
+            }
+        else:
+            _ACTIVE_UPSCALE_CTX = None
+
+        try:
+            return self._export_after_layer_select(
+                cache=cache,
+                data_path=data_path,
+                manifest_path=manifest_path,
+                manifest=manifest,
+                selected_layer=selected_layer,
+                vae=vae,
+                audio_vae=audio_vae,
+                fps=fps,
+                filename_prefix=filename_prefix,
+                output_directory=output_directory,
+                codec=codec,
+                crf=crf,
+                preset=preset,
+                audio_bitrate=audio_bitrate,
+                autoplay=autoplay,
+                unique_id=unique_id,
+            )
+        finally:
+            _ACTIVE_UPSCALE_CTX = None
+            if upscale_name not in ("", "None"):
+                try:
+                    from .latent_upscaler import offload_upscale_models
+                    offload_upscale_models()
+                except Exception:
+                    pass
+
+    def _export_after_layer_select(
+        self,
+        cache,
+        data_path,
+        manifest_path,
+        manifest,
+        selected_layer="draft",
+        vae=None,
+        audio_vae=None,
+        fps=24.0,
+        filename_prefix="MiniMax_H3_cached",
+        output_directory="",
+        codec="H.264",
+        crf=17,
+        preset="fast",
+        audio_bitrate="192k",
+        autoplay=True,
+        unique_id=None,
+    ):
         # FPS is cache metadata, never a user choice. The compatibility widget
         # value above is deliberately ignored so old workflows keep their widget
         # positions without being able to alter H3 timing.
@@ -3160,7 +3498,59 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         # persists that complete current sequence after every rendered clip.
         # The already encoded preview is reused directly: no extra sampling and
         # no second VAE decode are performed for the autosave.
+        #
+        # Refine sidecars are written with validated=False and without decoded
+        # MP4 blobs, so the progressive clip_by_clip path cannot consume them.
+        # Always fully decode the refine layer (draft progressive path unchanged).
         effective_mode = str(cache.get("run_mode", "full_batch")) if isinstance(cache, dict) else "full_batch"
+        if str(selected_layer or "") == "refine":
+            # Reuse a previously decoded refine preview when present so Save
+            # Preview / reload do not pay the H3 VAE cost again.
+            if _refine_preview_cache_ready(manifest, data_path):
+                committed = _decoded_preview_cache_path(data_path)
+                _LOG.info(
+                    "Disk Final Decode: reusing cached refine preview %s",
+                    committed.name,
+                )
+                progress = _FinalDecodeNativeProgress(unique_id, total=2)
+                preview_path = _reserve_preview_temp_path(unique_id)
+                try:
+                    os.link(committed, preview_path)
+                except Exception:
+                    shutil.copy2(committed, preview_path)
+                progress.advance()
+                autosave_path = _replace_output_from_preview(
+                    preview_path, out_dir, filename_prefix,
+                    ffmpeg=ffmpeg, color_timeline=color_timeline,
+                )
+                progress.advance()
+                progress.finish()
+                total_frames = int(manifest.get("final_frame_count", 0))
+                item = _comfy_media_item(preview_path, fps, "temp")
+                size = _cache_size_mb(data_path, manifest_path)
+                return {
+                    "ui": {
+                        "h3_video": [item],
+                        "h3_preview_info": [{
+                            "mode": "refine_cache",
+                            "clip": int(len(segments)),
+                            "preview_frames": int(total_frames),
+                            "total_clips": int(len(segments)),
+                            "cache_mode": "committed_refine_preview",
+                            "color_timeline": color_timeline,
+                            "color_preview_baked": False,
+                            "output": str(autosave_path) if autosave_path else "",
+                        }],
+                    },
+                    "result": (),
+                }
+
+            _LOG.info(
+                "Disk Final Decode: forcing full_batch decode for refine layer "
+                "(%s)",
+                Path(data_path).name,
+            )
+            effective_mode = "full_batch"
         if effective_mode == "clip_by_clip":
             progress = _FinalDecodeNativeProgress(unique_id, total=6)
             (
@@ -3248,7 +3638,9 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             # VIDEO - strict constant-memory path: one clip for N=1, otherwise
             # exactly one adjacent pair per seam. Nothing accumulated in IMAGE.
             if len(segments) == 1:
-                v = _load_segment_video(data_path, segments[0])
+                v = _maybe_upscale_segment_video(
+                    _load_segment_video(data_path, segments[0])
+                )
                 decoded = vae.decode(v)
                 progress.advance()
                 if decoded.ndim == 5:
@@ -3420,6 +3812,30 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 )
                 os.replace(color_temp, output_path)
                 progress.advance()
+
+            # Keep a durable decoded preview next to refine (and any full_batch
+            # layer decode) so the next Final Decode / browser restore can skip
+            # the heavy H3 VideoVAE pass.
+            if str(selected_layer or "") == "refine" or str(Path(data_path).name).endswith(
+                ".refine.h3cache"
+            ):
+                try:
+                    video_only = None
+                    # temp_video is the pre-mux video elementary stream used above.
+                    if "temp_video" in locals() and Path(temp_video).exists():
+                        video_only = temp_video
+                    manifest, _committed = _persist_layer_preview_cache(
+                        data_path,
+                        manifest_path,
+                        manifest,
+                        output_path,
+                        source_video_mp4=video_only,
+                    )
+                except Exception as exc:
+                    _LOG.warning(
+                        "Disk Final Decode: failed to persist refine preview cache: %s",
+                        exc,
+                    )
 
             shifts_text = ",".join(
                 f"{i}:{int(seam_shifts.get(i, 0))}" for i in range(1, len(segments))

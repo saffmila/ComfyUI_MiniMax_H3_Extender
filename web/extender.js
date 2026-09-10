@@ -53,16 +53,28 @@ function cardMinHeightForState(state) {
     return base + maxSelectedLoraRows(state) * 46;
 }
 
-function uiMinHeightForState(state) {
+// Always-visible Canvas size panel + collapsed PDD / Latent refine headers.
+const SECTIONS_COLLAPSED_RESERVE = 210;
+
+function sectionsStackHeight(runtime) {
+    const measured = Number(runtime?.sectionsWrap?.offsetHeight || 0);
+    if (Number.isFinite(measured) && measured > 0) return measured;
+    return SECTIONS_COLLAPSED_RESERVE;
+}
+
+function uiMinHeightForState(state, runtime = null) {
     // Both modes own the same media strip above the cards: Ref2VA shows the
     // nine internal references, FL2VA shows each plan's First/Last frames.
     // Keeping one fixed strip height also prevents mode switches from pulling
     // the DOM widget upward into the native widgets in Nodes 2.0.
-    return Math.max(UI_MIN_HEIGHT, 55 + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE);
+    return Math.max(
+        UI_MIN_HEIGHT,
+        55 + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE + sectionsStackHeight(runtime),
+    );
 }
 
-function nodes2MinHeightForState(state) {
-    return Math.max(NODES2_MIN_HEIGHT, uiMinHeightForState(state) + NODES2_TOP_GAP);
+function nodes2MinHeightForState(state, runtime = null) {
+    return Math.max(NODES2_MIN_HEIGHT, uiMinHeightForState(state, runtime) + NODES2_TOP_GAP);
 }
 
 const PROJECT_WIDGETS = [
@@ -85,6 +97,12 @@ const PROJECT_WIDGETS = [
     "pdd_nfe",
     "pdd_lora_strength",
     "pdd_head_strength",
+    "run_refine",
+    "latent_upscale_model",
+    "refine_megapixels",
+    "refine_denoise",
+    "refine_steps",
+    "latent_upscale_precision",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
@@ -1254,8 +1272,412 @@ function installPddWidgetHooks(node, runtime) {
             runtime,
             String(runtime?.state?.generation_mode || "ref2va") === "fl2va",
         );
+        syncExtenderSections(node, runtime);
         node?.graph?.setDirtyCanvas(true, true);
     };
+}
+
+function ensureExtenderSectionStyles() {
+    if (document.getElementById("h3-extender-section-style")) return;
+    const style = document.createElement("style");
+    style.id = "h3-extender-section-style";
+    style.textContent = `
+        .h3-ext-sections {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin: 0 0 8px;
+            flex: 0 0 auto;
+            min-width: 0;
+        }
+        .h3-ext-section {
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.18);
+            overflow: hidden;
+        }
+        .h3-ext-section-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: 100%;
+            padding: 6px 8px;
+            border: 0;
+            background: rgba(255, 255, 255, 0.04);
+            color: inherit;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            text-align: left;
+        }
+        .h3-ext-section-head:hover { background: rgba(255, 255, 255, 0.08); }
+        .h3-ext-section-chevron { opacity: 0.7; width: 12px; flex: 0 0 auto; }
+        .h3-ext-section-body {
+            display: none;
+            padding: 6px 8px 8px;
+            gap: 5px;
+            flex-direction: column;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .h3-ext-section.open .h3-ext-section-body { display: flex; }
+        .h3-ext-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+        .h3-ext-row label {
+            flex: 0 0 124px;
+            font-size: 10px;
+            opacity: 0.78;
+        }
+        .h3-ext-row select,
+        .h3-ext-row input[type="number"] {
+            flex: 1 1 auto;
+            min-width: 0;
+            font-size: 11px;
+        }
+        .h3-ext-row input[type="checkbox"] {
+            width: 14px;
+            height: 14px;
+        }
+        .h3-ext-hint {
+            font-size: 10px;
+            opacity: 0.62;
+            line-height: 1.35;
+            margin: 0 0 2px;
+        }
+        .h3-ext-spotlight {
+            border: 2px solid rgba(140, 210, 155, 0.55);
+            border-radius: 8px;
+            background: rgba(70, 150, 95, 0.10);
+            padding: 7px 8px 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            min-width: 0;
+        }
+        .h3-ext-spotlight-title {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            opacity: 0.92;
+            margin: 0 0 1px;
+        }
+        .h3-ext-spotlight .h3-ext-row label {
+            flex-basis: 132px;
+        }
+        .h3-ext-spotlight-field {
+            border: 2px solid rgba(140, 210, 155, 0.55);
+            border-radius: 7px;
+            background: rgba(70, 150, 95, 0.10);
+            padding: 4px 6px 6px;
+            box-sizing: border-box;
+            min-width: 0;
+        }
+        .h3-ext-spotlight-field input[type="number"] {
+            border-color: rgba(140, 210, 155, 0.45) !important;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+const CANVAS_SIZE_MODE_LABELS = {
+    auto_from_ref: "Auto (ref aspect + megapixels)",
+    manual: "Manual (width \u00d7 height)",
+};
+
+function widgetComboValues(widget) {
+    const values = widget?.options?.values;
+    if (Array.isArray(values)) return values.map((v) => String(v));
+    if (values && typeof values === "object") return Object.keys(values).map(String);
+    return [];
+}
+
+function setWidgetValueFromUi(widget, value) {
+    if (!widget) return;
+    widget.value = value;
+    if (typeof widget.callback === "function") {
+        try { widget.callback(value); } catch (_) {}
+    }
+}
+
+function createBoundSelectRow(labelText, widget, values, labelMap = null) {
+    const row = document.createElement("div");
+    row.className = "h3-ext-row";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    const select = document.createElement("select");
+    const opts = (values && values.length) ? values : widgetComboValues(widget);
+    for (const value of opts) {
+        const opt = document.createElement("option");
+        opt.value = String(value);
+        opt.textContent = (labelMap && labelMap[value]) || String(value);
+        select.appendChild(opt);
+    }
+    if (!opts.includes(String(widget?.value ?? "")) && opts.length) {
+        // Keep serialization intact even if the current value is temporarily missing.
+        const opt = document.createElement("option");
+        opt.value = String(widget?.value ?? "");
+        const missing = String(widget?.value ?? "");
+        opt.textContent = (labelMap && labelMap[missing]) || missing;
+        select.appendChild(opt);
+    }
+    select.value = String(widget?.value ?? opts[0] ?? "");
+    select.addEventListener("change", () => setWidgetValueFromUi(widget, select.value));
+    row.append(label, select);
+    row.__h3Select = select;
+    row.__h3Widget = widget;
+    return row;
+}
+
+function createBoundNumberRow(labelText, widget, { min = null, max = null, step = null } = {}) {
+    const row = document.createElement("div");
+    row.className = "h3-ext-row";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    const input = document.createElement("input");
+    input.type = "number";
+    if (min != null) input.min = String(min);
+    if (max != null) input.max = String(max);
+    if (step != null) input.step = String(step);
+    input.value = String(widget?.value ?? "");
+    input.addEventListener("change", () => {
+        const n = Number(input.value);
+        setWidgetValueFromUi(widget, Number.isFinite(n) ? n : widget.value);
+        input.value = String(widget.value);
+    });
+    row.append(label, input);
+    row.__h3Input = input;
+    row.__h3Widget = widget;
+    return row;
+}
+
+function createBoundCheckboxRow(labelText, widget) {
+    const row = document.createElement("div");
+    row.className = "h3-ext-row";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(widget?.value);
+    input.addEventListener("change", () => setWidgetValueFromUi(widget, Boolean(input.checked)));
+    row.append(label, input);
+    row.__h3Input = input;
+    row.__h3Widget = widget;
+    return row;
+}
+
+function createCollapsibleSection(title, { open = false, hint = "" } = {}) {
+    const section = document.createElement("div");
+    section.className = "h3-ext-section" + (open ? " open" : "");
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "h3-ext-section-head";
+    const chevron = document.createElement("span");
+    chevron.className = "h3-ext-section-chevron";
+    chevron.textContent = open ? "▾" : "▸";
+    const label = document.createElement("span");
+    label.textContent = title;
+    head.append(chevron, label);
+    const body = document.createElement("div");
+    body.className = "h3-ext-section-body";
+    if (hint) {
+        const hintEl = document.createElement("p");
+        hintEl.className = "h3-ext-hint";
+        hintEl.textContent = hint;
+        body.appendChild(hintEl);
+    }
+    head.addEventListener("click", (e) => {
+        e.preventDefault();
+        const next = !section.classList.contains("open");
+        section.classList.toggle("open", next);
+        chevron.textContent = next ? "▾" : "▸";
+        const runtime = section.__h3Runtime;
+        if (runtime) {
+            requestAnimationFrame(() => syncDomHeight(runtime.__h3Node || null, runtime, true));
+        }
+    });
+    section.append(head, body);
+    section.__h3Body = body;
+    section.__h3Chevron = chevron;
+    return section;
+}
+
+function syncDecodeLayerToFinal(node, value) {
+    const finalNode = connectedFinalDecode(node);
+    if (!finalNode) return;
+    const widget = getWidget(finalNode, "latent_layer");
+    if (!widget) return;
+    const next = String(value || "auto");
+    if (String(widget.value) === next) return;
+    widget.value = next;
+    if (typeof widget.callback === "function") {
+        try { widget.callback(next); } catch (_) {}
+    }
+    finalNode.graph?.setDirtyCanvas(true, true);
+}
+
+function syncExtenderSections(node, runtime) {
+    if (!runtime) return;
+    const pddActive = isPddAccActive(node, runtime);
+    for (const row of runtime.pddDetailRows || []) {
+        row.style.display = pddActive ? "flex" : "none";
+    }
+    const refineOn = Boolean(runtime.runRefineWidget?.value);
+    for (const row of runtime.refineDetailRows || []) {
+        row.style.display = refineOn ? "flex" : "none";
+    }
+    // Keep selects/inputs mirrored if native values changed elsewhere.
+    for (const row of [
+        ...(runtime.canvasSizeRows || []),
+        ...(runtime.pddAllRows || []),
+        ...(runtime.refineAllRows || []),
+    ]) {
+        const widget = row.__h3Widget;
+        if (!widget) continue;
+        if (row.__h3Select) row.__h3Select.value = String(widget.value ?? "");
+        if (row.__h3Input) {
+            if (row.__h3Input.type === "checkbox") row.__h3Input.checked = Boolean(widget.value);
+            else row.__h3Input.value = String(widget.value ?? "");
+        }
+    }
+    const mode = String(runtime.resolutionModeWidget?.value || "auto_from_ref");
+    if (runtime.megapixelsRow) {
+        // Megapixels only drives Auto; keep the control visible but quieter in Manual.
+        runtime.megapixelsRow.style.opacity = mode === "manual" ? "0.45" : "1";
+    }
+    if (runtime.decodeLayerSelect) {
+        const finalNode = connectedFinalDecode(node);
+        const finalWidget = finalNode ? getWidget(finalNode, "latent_layer") : null;
+        if (finalWidget) runtime.decodeLayerSelect.value = String(finalWidget.value || "auto");
+    }
+}
+
+function buildExtenderSections(node, runtime) {
+    ensureExtenderSectionStyles();
+    const wrap = document.createElement("div");
+    wrap.className = "h3-ext-sections";
+
+    const canvasPanel = document.createElement("div");
+    canvasPanel.className = "h3-ext-spotlight";
+    const canvasTitle = document.createElement("div");
+    canvasTitle.className = "h3-ext-spotlight-title";
+    canvasTitle.textContent = "Canvas size";
+    const canvasHint = document.createElement("p");
+    canvasHint.className = "h3-ext-hint";
+    canvasHint.textContent =
+        "Auto keeps aspect from the reference and scales to megapixels. Manual uses width \u00d7 height.";
+    const canvasModeRow = createBoundSelectRow(
+        "Size mode",
+        runtime.resolutionModeWidget,
+        ["auto_from_ref", "manual"],
+        CANVAS_SIZE_MODE_LABELS,
+    );
+    const megapixelsRow = createBoundNumberRow("Megapixels", runtime.megapixelsWidget, {
+        min: 0.01, max: 16, step: 0.01,
+    });
+    canvasPanel.append(canvasTitle, canvasHint, canvasModeRow, megapixelsRow);
+    runtime.canvasSizeRows = [canvasModeRow, megapixelsRow];
+    runtime.megapixelsRow = megapixelsRow;
+    canvasModeRow.__h3Select?.addEventListener("change", () => {
+        syncExtenderSections(node, runtime);
+    });
+
+    const pddSection = createCollapsibleSection("PDD Acc", {
+        open: false,
+        hint: "Alibaba PDD acceleration. When a PDD LoRA is selected, steps/scheduler are ignored.",
+    });
+    pddSection.__h3Runtime = runtime;
+    const pddLoraRow = createBoundSelectRow("PDD LoRA", runtime.pddAccLoraWidget);
+    const pddNfeRow = createBoundSelectRow("PDD NFE", runtime.pddNfeWidget);
+    const pddLoraStrengthRow = createBoundNumberRow("LoRA strength", runtime.pddLoraStrengthWidget, {
+        min: -2, max: 2, step: 0.01,
+    });
+    const pddHeadStrengthRow = createBoundNumberRow("Head strength", runtime.pddHeadStrengthWidget, {
+        min: 0, max: 2, step: 0.01,
+    });
+    runtime.pddAllRows = [pddLoraRow, pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow];
+    runtime.pddDetailRows = [pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow];
+    pddSection.__h3Body.append(pddLoraRow, pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow);
+    pddLoraRow.__h3Select?.addEventListener("change", () => {
+        syncModeSpecificNativeWidgets(
+            node,
+            runtime,
+            String(runtime?.state?.generation_mode || "ref2va") === "fl2va",
+        );
+        syncExtenderSections(node, runtime);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+    });
+
+    const refineSection = createCollapsibleSection("Latent refine", {
+        open: false,
+        hint: "Second pass: keep draft, neural latent upscale + resample. Then Queue Final Decode.",
+    });
+    refineSection.__h3Runtime = runtime;
+    const runRefineRow = createBoundCheckboxRow("Run refine pass", runtime.runRefineWidget);
+    const upscaleModelRow = createBoundSelectRow("Upscale model", runtime.latentUpscaleModelWidget);
+    const refineMpRow = createBoundNumberRow("Refine megapixels", runtime.refineMegapixelsWidget, {
+        min: 0.1, max: 8, step: 0.1,
+    });
+    const refineDenoiseRow = createBoundNumberRow("Refine denoise", runtime.refineDenoiseWidget, {
+        min: 0.01, max: 1, step: 0.01,
+    });
+    const refineStepsRow = createBoundNumberRow("Refine steps", runtime.refineStepsWidget, {
+        min: 1, max: 10000, step: 1,
+    });
+    const refinePrecisionRow = createBoundSelectRow("Upscale precision", runtime.latentUpscalePrecisionWidget, [
+        "fp16", "bf16", "fp32",
+    ]);
+
+    const decodeLayerRow = document.createElement("div");
+    decodeLayerRow.className = "h3-ext-row";
+    const decodeLabel = document.createElement("label");
+    decodeLabel.textContent = "Final Decode layer";
+    const decodeSelect = document.createElement("select");
+    for (const value of ["auto", "draft", "refine"]) {
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = value;
+        decodeSelect.appendChild(opt);
+    }
+    const finalNode = connectedFinalDecode(node);
+    decodeSelect.value = String(getWidget(finalNode, "latent_layer")?.value || "auto");
+    decodeSelect.addEventListener("change", () => {
+        syncDecodeLayerToFinal(node, decodeSelect.value);
+    });
+    decodeLayerRow.append(decodeLabel, decodeSelect);
+    runtime.decodeLayerSelect = decodeSelect;
+
+    runtime.refineAllRows = [
+        runRefineRow, upscaleModelRow, refineMpRow, refineDenoiseRow, refineStepsRow, refinePrecisionRow, decodeLayerRow,
+    ];
+    runtime.refineDetailRows = [
+        upscaleModelRow, refineMpRow, refineDenoiseRow, refineStepsRow, refinePrecisionRow,
+    ];
+    refineSection.__h3Body.append(
+        runRefineRow,
+        upscaleModelRow,
+        refineMpRow,
+        refineDenoiseRow,
+        refineStepsRow,
+        refinePrecisionRow,
+        decodeLayerRow,
+    );
+    runRefineRow.__h3Input?.addEventListener("change", () => {
+        syncExtenderSections(node, runtime);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+    });
+
+    wrap.append(canvasPanel, pddSection, refineSection);
+    runtime.sectionsWrap = wrap;
+    runtime.canvasPanel = canvasPanel;
+    runtime.pddSection = pddSection;
+    runtime.refineSection = refineSection;
+    runtime.__h3Node = node;
+    syncExtenderSections(node, runtime);
+    return wrap;
 }
 
 function domWidgetRenderMode(element) {
@@ -3314,6 +3736,7 @@ function render(node, runtime) {
         seedBox.appendChild(seedMode);
 
         const durBox = document.createElement("div");
+        durBox.className = "h3-ext-spotlight-field";
         durBox.appendChild(makeFieldLabel("Duration s"));
         const duration = makeNumberInput(clip.duration, 0.25, 150, 0.1);
         duration.addEventListener("change", () => {
@@ -3395,7 +3818,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
     if (mode === "nodes2") {
         const currentH = Number(node.size?.[1] || 0);
         const y = Number(runtime.domWidget.last_y);
-        const nodes2MinH = nodes2MinHeightForState(runtime.state);
+        const nodes2MinH = nodes2MinHeightForState(runtime.state, runtime);
         const fallbackH = Number.isFinite(y) && y > 0
             ? y + nodes2MinH + BOTTOM_PAD
             : nodes2MinH + 180;
@@ -3474,7 +3897,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
     try {
         let w = Math.max(NODE_MIN_WIDTH, Number(node.size?.[0] || NODE_MIN_WIDTH));
         let h = Number(node.size?.[1] || 0);
-        const uiMinH = uiMinHeightForState(runtime.state);
+        const uiMinH = uiMinHeightForState(runtime.state, runtime);
         const minNodeH = y + uiMinH + BOTTOM_PAD;
         const returningFromNodes2 = runtime.lastRenderMode === "nodes2";
 
@@ -3506,8 +3929,9 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
 
         const actualH = Number(node.size?.[1] || h);
         const available = Math.max(uiMinH, actualH - y - BOTTOM_PAD);
+        const sectionsH = sectionsStackHeight(runtime);
         runtime.root.style.height = `${available}px`;
-        runtime.cards.style.height = `${Math.max(340, available - 55 - REF_SECTION_HEIGHT)}px`;
+        runtime.cards.style.height = `${Math.max(340, available - 55 - REF_SECTION_HEIGHT - sectionsH)}px`;
         runtime.cards.style.flex = "0 0 auto";
         runtime.cards.style.minHeight = "";
         runtime.domHeight = available;
@@ -3538,10 +3962,38 @@ function buildUi(node) {
     const stepsWidget = getWidget(node, "steps");
     const schedulerWidget = getWidget(node, "scheduler");
     const pddAccLoraWidget = getWidget(node, "pdd_acc_lora");
+    const pddNfeWidget = getWidget(node, "pdd_nfe");
+    const pddLoraStrengthWidget = getWidget(node, "pdd_lora_strength");
+    const pddHeadStrengthWidget = getWidget(node, "pdd_head_strength");
+    const resolutionModeWidget = getWidget(node, "resolution_mode");
+    const megapixelsWidget = getWidget(node, "megapixels");
+    const runRefineWidget = getWidget(node, "run_refine");
+    const latentUpscaleModelWidget = getWidget(node, "latent_upscale_model");
+    const refineMegapixelsWidget = getWidget(node, "refine_megapixels");
+    const refineDenoiseWidget = getWidget(node, "refine_denoise");
+    const refineStepsWidget = getWidget(node, "refine_steps");
+    const latentUpscalePrecisionWidget = getWidget(node, "latent_upscale_precision");
     if (!jsonWidget || !refsWidget || !generationModeWidget) return null;
     hideNativeWidget(node, jsonWidget);
     hideNativeWidget(node, refsWidget);
     hideNativeWidget(node, generationModeWidget);
+    // Canvas size + PDD + Latent refine live in the custom section stack.
+    for (const widget of [
+        resolutionModeWidget,
+        megapixelsWidget,
+        pddAccLoraWidget,
+        pddNfeWidget,
+        pddLoraStrengthWidget,
+        pddHeadStrengthWidget,
+        runRefineWidget,
+        latentUpscaleModelWidget,
+        refineMegapixelsWidget,
+        refineDenoiseWidget,
+        refineStepsWidget,
+        latentUpscalePrecisionWidget,
+    ]) {
+        hideNativeWidget(node, widget);
+    }
 
     const state = parseState(jsonWidget.value);
     // clips_json is the durable source of truth for the active mode. On workflow
@@ -3719,10 +4171,8 @@ function buildUi(node) {
     cards.style.scrollbarGutter = "stable";
     cards.style.boxSizing = "border-box";
     cards.style.scrollBehavior = "smooth";
-    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - REF_SECTION_HEIGHT)}px`;
+    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - REF_SECTION_HEIGHT - SECTIONS_COLLAPSED_RESERVE)}px`;
     cards.style.minHeight = `${cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE}px`;
-
-    root.append(toolbar, refsSection, cards, refFileInput, frameFileInput);
 
     const restoredValidatedPrefix = validatedPrefixFromState(state);
     const runtime = {
@@ -3749,6 +4199,17 @@ function buildUi(node) {
         stepsWidget,
         schedulerWidget,
         pddAccLoraWidget,
+        pddNfeWidget,
+        pddLoraStrengthWidget,
+        pddHeadStrengthWidget,
+        resolutionModeWidget,
+        megapixelsWidget,
+        runRefineWidget,
+        latentUpscaleModelWidget,
+        refineMegapixelsWidget,
+        refineDenoiseWidget,
+        refineStepsWidget,
+        latentUpscalePrecisionWidget,
         modeButton,
         pendingRefSlot: -1,
         pendingFrameClip: -1,
@@ -3830,6 +4291,10 @@ function buildUi(node) {
         }
     });
 
+    const sectionsWrap = buildExtenderSections(node, runtime);
+    // Immediately under native megapixels / sampling widgets, above MODE / clips UI.
+    root.append(sectionsWrap, toolbar, refsSection, cards, refFileInput, frameFileInput);
+
     const domWidget = node.addDOMWidget("h3_extender_timeline", "timeline", root, {
         serialize: false,
         hideOnZoom: false,
@@ -3838,15 +4303,15 @@ function buildUi(node) {
         // Legacy minimum unchanged.
         getMinHeight: () =>
             globalThis.LiteGraph?.vueNodesMode
-                ? nodes2MinHeightForState(runtime.state)
-                : uiMinHeightForState(runtime.state),
+                ? nodes2MinHeightForState(runtime.state, runtime)
+                : uiMinHeightForState(runtime.state, runtime),
         getHeight: () => runtime.domHeight,
         afterResize: (resizedNode) => {
             const mode = domWidgetRenderMode(root);
             if (mode === "nodes2") {
                 // Re-assert only intrinsic CSS. Never derive anything from
                 // node.size while Vue is resolving its grid.
-                const nodes2MinH = nodes2MinHeightForState(runtime.state);
+                const nodes2MinH = nodes2MinHeightForState(runtime.state, runtime);
                 root.style.height = "auto";
                 root.style.minHeight = `${nodes2MinH}px`;
                 root.style.setProperty("--comfy-widget-min-height", `${nodes2MinH}px`);
@@ -3871,8 +4336,10 @@ function buildUi(node) {
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
     installPddWidgetHooks(node, runtime);
+    syncExtenderSections(node, runtime);
     render(node, runtime);
     refreshLoraNames(node, runtime);
+    requestAnimationFrame(() => syncDomHeight(node, runtime, true));
 
     const oldConfigure = node.onConfigure;
     node.onConfigure = function (info) {
