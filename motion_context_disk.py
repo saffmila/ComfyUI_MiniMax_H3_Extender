@@ -228,6 +228,49 @@ def _clear_refine_sidecar(data_path):
             pass
 
 
+def _invalidate_refine_from_index(data_path, index):
+    """
+    Drop refine from ``index`` onward after a draft rewrite.
+
+    Draft clip N changing invalidates refine N..end (motion/geometry), but
+    keeps an already refined prefix 0..N-1 intact for clip_by_clip workflows.
+    """
+    index = max(0, int(index))
+    if index <= 0:
+        _clear_refine_sidecar(data_path)
+        return None
+
+    refine_data, refine_manifest_path = _refine_paths_from_draft(data_path)
+    if not refine_data.exists() or not refine_manifest_path.exists():
+        return None
+    try:
+        refine_manifest = json.loads(
+            refine_manifest_path.read_text(encoding="utf-8")
+        )
+    except Exception:
+        _clear_refine_sidecar(data_path)
+        return None
+
+    segments = list(refine_manifest.get("segments") or [])
+    if not segments:
+        _clear_refine_sidecar(data_path)
+        return None
+    if index >= len(segments):
+        # Draft grew past the refine prefix; keep existing refine segments.
+        return refine_manifest
+
+    refine_manifest = _truncate_chain(
+        refine_data, refine_manifest_path, refine_manifest, index
+    )
+    refine_manifest = _invalidate_layer_preview_cache(
+        refine_data, refine_manifest_path, refine_manifest
+    )
+    if not refine_manifest.get("segments"):
+        _clear_refine_sidecar(data_path)
+        return None
+    return refine_manifest
+
+
 def _refine_preview_cache_ready(manifest, data_path):
     """True when a full decoded refine preview can be shown without VAE."""
     if not isinstance(manifest, dict):
@@ -306,7 +349,13 @@ def _persist_layer_preview_cache(
     return updated, committed
 
 
-def _refine_manifest_available(data_path, draft_manifest):
+def _load_refine_sidecar(data_path, draft_manifest, *, require_complete=True):
+    """
+    Load refine sidecar next to draft.
+
+    ``require_complete=True`` (auto layer): every draft clip must have a refine
+    segment. ``False`` allows a causal prefix for clip_by_clip testing.
+    """
     refine_data, refine_manifest_path = _refine_paths_from_draft(data_path)
     if not refine_data.exists() or not refine_manifest_path.exists():
         return None
@@ -318,9 +367,39 @@ def _refine_manifest_available(data_path, draft_manifest):
         return None
     draft_segments = draft_manifest.get("segments", []) if isinstance(draft_manifest, dict) else []
     refine_segments = refine_manifest.get("segments", []) if isinstance(refine_manifest, dict) else []
-    if not refine_segments or len(refine_segments) != len(draft_segments):
+    if not refine_segments:
+        return None
+    if len(refine_segments) > len(draft_segments):
+        return None
+    if require_complete and len(refine_segments) != len(draft_segments):
         return None
     return refine_data, refine_manifest_path, refine_manifest
+
+
+def _refine_manifest_available(data_path, draft_manifest):
+    """Complete refine sidecar only (same rule as Final Decode ``auto``)."""
+    return _load_refine_sidecar(data_path, draft_manifest, require_complete=True)
+
+
+def _invalidate_layer_preview_cache(data_path, manifest_path, manifest):
+    """Drop committed preview files after refine/draft segment mutation."""
+    data_path = Path(data_path)
+    committed = _decoded_preview_cache_path(data_path)
+    committed_video = _decoded_preview_video_cache_path(data_path)
+    for path in (committed, committed_video):
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+    updated = dict(manifest or {})
+    updated["preview_committed_count"] = 0
+    updated.pop("preview_audio_mode", None)
+    updated.pop("preview_portable_full", None)
+    updated["updated_at"] = time.time()
+    if manifest_path is not None:
+        _write_json_atomic(manifest_path, updated)
+    return updated
 
 
 def _select_latent_layer(data_path, manifest_path, manifest, latent_layer="auto"):
@@ -332,20 +411,22 @@ def _select_latent_layer(data_path, manifest_path, manifest, latent_layer="auto"
     if layer == "draft":
         return data_path, manifest_path, manifest, "draft"
 
-    refine = _refine_manifest_available(data_path, manifest)
     if layer == "refine":
+        # Explicit refine may be a clip_by_clip prefix for settings tests.
+        refine = _load_refine_sidecar(data_path, manifest, require_complete=False)
         if refine is None:
             # Common after a fresh draft rewrite: run_refine sidecar was cleared.
             # Fall back to draft instead of failing the whole Final Decode queue.
             _LOG.warning(
-                "Disk Final Decode: latent_layer=refine but no complete refine "
+                "Disk Final Decode: latent_layer=refine but no refine "
                 "cache was found; falling back to draft. Re-run Extender with "
                 "run_refine=True to rebuild the refine sidecar."
             )
             return data_path, manifest_path, manifest, "draft"
         return refine[0], refine[1], refine[2], "refine"
 
-    # auto
+    # auto: only a complete refine sidecar replaces draft
+    refine = _refine_manifest_available(data_path, manifest)
     if refine is not None:
         return refine[0], refine[1], refine[2], "refine"
     return data_path, manifest_path, manifest, "draft"
@@ -1523,6 +1604,59 @@ def _write_audio_raw(file_obj, wave):
     file_obj.write(x.numpy().astype("float32", copy=False).tobytes(order="C"))
 
 
+def _cpu_image_chunk(frames):
+    """Keep an optional stitch accumulate buffer on CPU."""
+    return frames.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+
+def _rewrite_raw_audio_for_seamless_stitch(raw_audio_path, sample_rate, channels, fps, stitch_meta):
+    """Video-only stitch audio: silence for original+bridge, then AI tail after skip.
+
+    Original Instagram audio is not muxed yet; the kept original picture track is
+    silent until a later audio-aware stitch lands.
+    """
+    sr = int(sample_rate)
+    ch = int(channels)
+    raw = np.fromfile(str(raw_audio_path), dtype=np.float32)
+    if raw.size % ch != 0:
+        raise RuntimeError(
+            "Disk Final Decode stitch: raw AI audio size is not divisible by channel count."
+        )
+    # Written as [T, C] interleaved float32.
+    wave = torch.from_numpy(np.ascontiguousarray(raw.reshape(-1, ch).T)).unsqueeze(0)
+
+    prefix_frames = int(stitch_meta["original_kept"]) + int(stitch_meta["bridge"])
+    skip_first = int(stitch_meta["ai_skip_first"])
+    total_frames = int(stitch_meta["total_frames"])
+
+    prefix_samples = max(0, int(round(prefix_frames / float(fps) * sr)))
+    skip_samples = max(0, int(round(skip_first / float(fps) * sr)))
+    wanted = max(1, int(round(total_frames / float(fps) * sr)))
+
+    tail = wave[..., skip_samples:]
+    silence = torch.zeros(
+        (int(wave.shape[0]), ch, prefix_samples),
+        dtype=torch.float32,
+        device="cpu",
+    )
+    combined = torch.cat([silence, tail.float().cpu()], dim=-1)
+    if int(combined.shape[-1]) < wanted:
+        pad = wanted - int(combined.shape[-1])
+        combined = torch.cat(
+            [
+                combined,
+                torch.zeros((int(combined.shape[0]), ch, pad), dtype=torch.float32),
+            ],
+            dim=-1,
+        )
+    elif int(combined.shape[-1]) > wanted:
+        combined = combined[..., :wanted]
+
+    with open(raw_audio_path, "wb") as af:
+        _write_audio_raw(af, combined)
+    return sr, ch, int(combined.shape[-1])
+
+
 def _mux_final(ffmpeg, temp_video, raw_audio, output_path, sr, channels, codec, audio_bitrate, log_path):
     audio_args = ["-c:a", "flac"] if str(codec) == "FFV1 lossless" else ["-c:a", "aac", "-b:a", str(audio_bitrate)]
     cmd = [
@@ -1712,6 +1846,32 @@ def _color_timeline(segments, fps):
             "adjustment": adjustment,
             "modified": not _color_is_neutral(adjustment),
         })
+    return out
+
+
+def _shift_timeline_for_stitch(timeline, stitch_meta, fps):
+    """Map AI-only clip times onto the stitched timeline (original + bridge + AI)."""
+    if not stitch_meta:
+        return [dict(item) for item in (timeline or [])]
+    fps = float(fps or FPS)
+    if not math.isfinite(fps) or fps <= 0.0:
+        fps = float(FPS)
+    kept = max(0, int(stitch_meta.get("original_kept", 0)))
+    bridge = max(0, int(stitch_meta.get("bridge", 0)))
+    skip = max(0, int(stitch_meta.get("ai_skip_first", 0)))
+    prefix_s = (kept + bridge) / fps
+    skip_s = skip / fps
+    out = []
+    for item in timeline or []:
+        start = float(item.get("start", 0.0)) - skip_s
+        end = float(item.get("end", start)) - skip_s
+        if end <= 0.0:
+            continue
+        start = max(0.0, start)
+        shifted = dict(item)
+        shifted["start"] = start + prefix_s
+        shifted["end"] = end + prefix_s
+        out.append(shifted)
     return out
 
 
@@ -2882,6 +3042,93 @@ def _export_live_candidate_preview(
 
 
 
+def _layer_preview_availability(owner_id, generation_mode="ref2va"):
+    """Report whether committed draft/refine preview MP4s exist (no VAE)."""
+    if str(generation_mode or "ref2va").lower() == "fl2va":
+        from .fl2va_engine import cache_owner_id
+        cache_owner = cache_owner_id(owner_id)
+    else:
+        cache_owner = f"extender_{_safe_name(owner_id)}"
+    data_path, manifest_path = _chain_paths(cache_owner)
+    out = {
+        "draft": {"ready": False, "clip_count": 0, "frame_count": 0},
+        "refine": {"ready": False, "clip_count": 0, "frame_count": 0, "complete": False},
+    }
+    if not data_path.exists() or not manifest_path.exists():
+        return out
+    manifest = _load_manifest_from_paths(data_path, manifest_path)
+    if manifest is None:
+        return out
+    draft_segments = list(manifest.get("segments") or [])
+    if draft_segments and _refine_preview_cache_ready(manifest, data_path):
+        out["draft"] = {
+            "ready": True,
+            "clip_count": int(len(draft_segments)),
+            "frame_count": int(manifest.get("final_frame_count", 0)),
+        }
+
+    refine = _load_refine_sidecar(data_path, manifest, require_complete=False)
+    if refine is not None:
+        refine_data, _rmp, refine_manifest = refine
+        refine_segments = list(refine_manifest.get("segments") or [])
+        complete = len(refine_segments) == len(draft_segments) and len(draft_segments) > 0
+        out["refine"] = {
+            "ready": bool(_refine_preview_cache_ready(refine_manifest, refine_data)),
+            "clip_count": int(len(refine_segments)),
+            "frame_count": int(refine_manifest.get("final_frame_count", 0)),
+            "complete": bool(complete),
+        }
+    return out
+
+
+def _publish_layer_preview(owner_id, final_id, layer, generation_mode="ref2va"):
+    """Copy a committed draft/refine preview into ComfyUI temp for /view."""
+    layer = str(layer or "draft").strip().lower()
+    if str(generation_mode or "ref2va").lower() == "fl2va":
+        from .fl2va_engine import cache_owner_id
+        cache_owner = cache_owner_id(owner_id)
+    else:
+        cache_owner = f"extender_{_safe_name(owner_id)}"
+    data_path, manifest_path = _chain_paths(cache_owner)
+    if not data_path.exists() or not manifest_path.exists():
+        return None
+    draft_manifest = _load_manifest_from_paths(data_path, manifest_path)
+    if draft_manifest is None:
+        return None
+
+    if layer == "refine":
+        refine = _load_refine_sidecar(data_path, draft_manifest, require_complete=False)
+        if refine is None:
+            return None
+        src_data, _src_manifest_path, src_manifest = refine
+        cache_mode = "committed_refine_preview"
+    else:
+        src_data = data_path
+        src_manifest = draft_manifest
+        cache_mode = "committed_preview"
+
+    if not _refine_preview_cache_ready(src_manifest, src_data):
+        return None
+
+    committed = _decoded_preview_cache_path(src_data)
+    preview_path = _reserve_preview_temp_path(final_id)
+    try:
+        os.link(committed, preview_path)
+    except Exception:
+        shutil.copy2(committed, preview_path)
+
+    segments = list(src_manifest.get("segments") or [])
+    fps = float(src_manifest.get("fps", draft_manifest.get("fps", FPS)))
+    return {
+        "video": _comfy_media_item(preview_path, fps, "temp"),
+        "clip_count": int(len(segments)),
+        "frame_count": int(src_manifest.get("final_frame_count", 0)),
+        "color_timeline": _color_timeline(segments, fps),
+        "cache_mode": cache_mode,
+        "path": preview_path,
+    }
+
+
 def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="ref2va"):
     """
     Rebuild the current full preview using ONLY already cached decoded MP4 blobs.
@@ -3216,11 +3463,26 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             if is_fl2va:
                 from .fl2va_engine import continuity_signatures_for_segments
                 continuity_signatures = continuity_signatures_for_segments(data_path, segments)
+
+            refine_cached_count = 0
+            refine_validated_count = 0
+            refine_complete = False
+            if not is_fl2va:
+                refine = _load_refine_sidecar(data_path, manifest, require_complete=False)
+                if refine is not None:
+                    refine_segments = list((refine[2] or {}).get("segments") or [])
+                    refine_cached_count = len(refine_segments)
+                    refine_validated_count = int(_validated_prefix_count(refine_segments))
+                    refine_complete = len(refine_segments) == len(segments) and len(segments) > 0
+
             return web.json_response({
                 "found": True,
                 "generation_mode": "fl2va" if is_fl2va else "ref2va",
                 "cached_count": int(len(segments)),
                 "validated_count": int(validated_count),
+                "refine_cached_count": int(refine_cached_count),
+                "refine_validated_count": int(refine_validated_count),
+                "refine_complete": bool(refine_complete),
                 "cached_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "")],
                 "validated_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "") and bool(x.get("validated", False))],
                 "continuity_signatures": continuity_signatures,
@@ -3278,6 +3540,11 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 "frame_count": restored["frame_count"],
                 "cache_mode": restored["cache_mode"],
                 "color_timeline": color_timeline,
+                "layers": _layer_preview_availability(owner_id, generation_mode),
+                "active_layer": (
+                    "refine" if str(restored.get("cache_mode") or "").startswith("committed_refine")
+                    else "draft"
+                ),
             })
         except Exception as exc:
             _LOG.warning("H3 restore preview on load failed: %s", exc)
@@ -3286,6 +3553,121 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 "reason": "restore_failed",
             })
 
+    @PromptServer.instance.routes.get("/h3_extender/layer_preview")
+    async def h3_extender_layer_preview(request):
+        """Republish draft or refine committed preview without VAE decode."""
+        owner_id = request.query.get("owner_id", "")
+        final_id = request.query.get("final_id", "")
+        layer = str(request.query.get("layer") or "draft").strip().lower()
+        status_only = str(request.query.get("status_only") or "").strip().lower() in (
+            "1", "true", "yes",
+        )
+        if not owner_id or not final_id:
+            return web.json_response({"ok": False, "error": "missing_id"}, status=400)
+        if layer not in ("draft", "refine"):
+            return web.json_response({"ok": False, "error": "layer must be draft or refine"}, status=400)
+        try:
+            generation_mode = str(request.query.get("mode") or "ref2va").lower()
+            layers = _layer_preview_availability(owner_id, generation_mode)
+            if status_only:
+                return web.json_response({
+                    "ok": True,
+                    "status_only": True,
+                    "layer": layer,
+                    "layers": layers,
+                    "ready": bool(layers.get(layer, {}).get("ready")),
+                })
+            payload = _publish_layer_preview(owner_id, final_id, layer, generation_mode)
+            if payload is None:
+                return web.json_response({
+                    "ok": False,
+                    "ready": False,
+                    "layer": layer,
+                    "layers": layers,
+                })
+            return web.json_response({
+                "ok": True,
+                "ready": True,
+                "layer": layer,
+                "video": payload["video"],
+                "clip_count": payload["clip_count"],
+                "frame_count": payload["frame_count"],
+                "color_timeline": payload["color_timeline"],
+                "cache_mode": payload["cache_mode"],
+                "layers": layers,
+            })
+        except Exception as exc:
+            _LOG.warning("H3 layer preview failed: %s", exc)
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
+
+def _resolve_stitch_params(
+    stitch_json="",
+    ref_frames_offset=20,
+    rife_multiplier=2,
+    rife_ckpt=None,
+    rife_fast_mode=False,
+    rife_ensemble=True,
+    ai_skip_first=1,
+):
+    """Prefer stitch_json (UI durable blob) over individual widgets that may shift."""
+    parsed = None
+    raw = stitch_json if isinstance(stitch_json, str) else ""
+    if raw.strip():
+        try:
+            candidate = json.loads(raw)
+            if isinstance(candidate, dict) and any(
+                key in candidate
+                for key in (
+                    "ref_frames_offset",
+                    "rife_multiplier",
+                    "rife_ckpt",
+                    "rife_fast_mode",
+                    "rife_ensemble",
+                    "ai_skip_first",
+                )
+            ):
+                parsed = candidate
+        except Exception:
+            parsed = None
+
+    def _int(name, fallback, lo, hi):
+        src = parsed.get(name, fallback) if parsed is not None else fallback
+        try:
+            value = int(src)
+        except Exception:
+            value = int(fallback)
+        return max(lo, min(hi, value))
+
+    def _bool(name, fallback):
+        src = parsed.get(name, fallback) if parsed is not None else fallback
+        if isinstance(src, bool):
+            return src
+        if isinstance(src, (int, float)):
+            return bool(src)
+        s = str(src).strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off", ""):
+            return False
+        return bool(fallback)
+
+    offset = _int("ref_frames_offset", ref_frames_offset, 0, 256)
+    mult = _int("rife_multiplier", rife_multiplier, 2, 8)
+    if mult % 2:
+        mult += 1
+        mult = min(8, mult)
+    skip = _int("ai_skip_first", ai_skip_first, 0, 16)
+    fast = _bool("rife_fast_mode", rife_fast_mode)
+    ensemble = _bool("rife_ensemble", rife_ensemble)
+
+    ckpt = rife_ckpt
+    if parsed is not None and "rife_ckpt" in parsed:
+        ckpt = parsed.get("rife_ckpt")
+    from .stitch_bridge import coerce_rife_ckpt
+    ckpt = coerce_rife_ckpt(ckpt)
+    return offset, mult, ckpt, fast, ensemble, skip
 
 
 class MiniMaxH3MotionContextDiskFinalDecode:
@@ -3296,6 +3678,20 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             upscale_models = scan_upscale_models()
         except Exception:
             upscale_models = ["None"]
+        try:
+            from .stitch_bridge import default_rife_ckpt, rife_ckpt_choices
+
+            _rife_ckpts = rife_ckpt_choices()
+            _default_rife = default_rife_ckpt()
+        except Exception:
+            _rife_ckpts = [
+                "rife47.pth",
+                "rife49.pth",
+                "rife417.pth",
+                "rife426.pth",
+                "sudo_rife4_269.662_testV1_scale1.pth",
+            ]
+            _default_rife = "rife49.pth"
         return {
             "required": {
                 "cache": (CACHE_TYPE,),
@@ -3317,7 +3713,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     ["auto", "draft", "refine"],
                     {
                         "default": "auto",
-                        "tooltip": "auto uses a complete refine sidecar when present, otherwise draft. Refine never deletes draft.",
+                        "tooltip": "auto uses a complete refine sidecar when present, otherwise draft. Explicit refine may decode a clip_by_clip prefix. Refine never deletes draft.",
                     },
                 ),
                 "latent_upscale_model": (
@@ -3340,6 +3736,77 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "latent_upscale_precision": (
                     ["fp16", "bf16", "fp32"],
                     {"default": "fp16"},
+                ),
+            },
+            "optional": {
+                # Optional Instagram / source clip for SeamlessVideoStitcher.
+                # Disconnected = Extender behaves exactly as before (no MinimaxUtils).
+                "original_images": (
+                    "IMAGE",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Optional full original video (IMAGE batch). When connected, Final Decode soft-calls Seamless Video Stitcher (Comfyui-MinimaxUtils + Frame-Interpolation) and exports original[:cut] + RIFE bridge + AI. Leave disconnected for normal Extender-only export.",
+                    },
+                ),
+                "ref_frames_offset": (
+                    "INT",
+                    {
+                        "default": 20,
+                        "min": 0,
+                        "max": 256,
+                        "step": 1,
+                        "tooltip": "Trailing original frames used as AI reference. cut_index = original_length - this. Used only when original_images is connected.",
+                    },
+                ),
+                "rife_multiplier": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 2,
+                        "max": 8,
+                        "step": 2,
+                        "tooltip": "RIFE bridge density: 2 → 1 bridge frame; 4 → 3. Used only when original_images is connected.",
+                    },
+                ),
+                "rife_ckpt": (
+                    _rife_ckpts,
+                    {
+                        "default": _default_rife,
+                        "tooltip": "RIFE checkpoint from ComfyUI-Frame-Interpolation. Used only when original_images is connected.",
+                    },
+                ),
+                "rife_fast_mode": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Faster / lower quality RIFE. Used only when original_images is connected.",
+                    },
+                ),
+                "rife_ensemble": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Bidirectional RIFE ensemble at the seam. Used only when original_images is connected.",
+                    },
+                ),
+                "ai_skip_first": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 16,
+                        "step": 1,
+                        "tooltip": "Skip leading frozen AI frames before the bridge. Used only when original_images is connected.",
+                    },
+                ),
+                # Hidden durable blob written by the Final Decode stitch UI. Survives
+                # widget-type / widgets_values reshuffles that used to flip offset→2.
+                "stitch_json": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                    },
                 ),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -3387,6 +3854,14 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         latent_upscale_model="None",
         latent_upscale_megapixels=1.0,
         latent_upscale_precision="fp16",
+        original_images=None,
+        ref_frames_offset=20,
+        rife_multiplier=2,
+        rife_ckpt=None,
+        rife_fast_mode=False,
+        rife_ensemble=True,
+        ai_skip_first=1,
+        stitch_json="",
         unique_id=None,
     ):
         global _ACTIVE_UPSCALE_CTX
@@ -3396,6 +3871,24 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             latent_upscale_model = "None"
         if str(latent_upscale_precision or "").strip() == "":
             latent_upscale_precision = "fp16"
+
+        (
+            ref_frames_offset,
+            rife_multiplier,
+            rife_ckpt,
+            rife_fast_mode,
+            rife_ensemble,
+            ai_skip_first,
+        ) = _resolve_stitch_params(
+            stitch_json=stitch_json,
+            ref_frames_offset=ref_frames_offset,
+            rife_multiplier=rife_multiplier,
+            rife_ckpt=rife_ckpt,
+            rife_fast_mode=rife_fast_mode,
+            rife_ensemble=rife_ensemble,
+            ai_skip_first=ai_skip_first,
+        )
+
         data_path, manifest_path, manifest = _load_manifest(cache)
         data_path, manifest_path, manifest, selected_layer = _select_latent_layer(
             data_path, manifest_path, manifest, latent_layer
@@ -3435,6 +3928,13 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 preset=preset,
                 audio_bitrate=audio_bitrate,
                 autoplay=autoplay,
+                original_images=original_images,
+                ref_frames_offset=ref_frames_offset,
+                rife_multiplier=rife_multiplier,
+                rife_ckpt=rife_ckpt,
+                rife_fast_mode=rife_fast_mode,
+                rife_ensemble=rife_ensemble,
+                ai_skip_first=ai_skip_first,
                 unique_id=unique_id,
             )
         finally:
@@ -3463,6 +3963,13 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         preset="fast",
         audio_bitrate="192k",
         autoplay=True,
+        original_images=None,
+        ref_frames_offset=20,
+        rife_multiplier=2,
+        rife_ckpt=None,
+        rife_fast_mode=False,
+        rife_ensemble=True,
+        ai_skip_first=1,
         unique_id=None,
     ):
         # FPS is cache metadata, never a user choice. The compatibility widget
@@ -3474,6 +3981,28 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")
+
+        # Optional SeamlessVideoStitcher path. Disconnected original_images keeps
+        # the historical Extender-only export (no MinimaxUtils import).
+        do_stitch = original_images is not None
+        stitch_meta = None
+        if do_stitch:
+            _LOG.info(
+                "Disk Final Decode stitch: offset=%s mult=%s skip=%s ckpt=%s "
+                "fast=%s ensemble=%s",
+                int(ref_frames_offset),
+                int(rife_multiplier),
+                int(ai_skip_first),
+                rife_ckpt,
+                bool(rife_fast_mode),
+                bool(rife_ensemble),
+            )
+        if do_stitch and str(manifest.get("sequence_mode") or "ref2va").lower() == "fl2va":
+            raise ValueError(
+                "MiniMax H3 Final Decode: original_images seamless stitch is "
+                "supported for Ref2VA exports only (not FL2VA yet)."
+            )
+
         if str(manifest.get("sequence_mode") or "ref2va").lower() == "fl2va":
             from .fl2va_engine import export_fl2va_final
             return export_fl2va_final(
@@ -3483,6 +4012,16 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 unique_id=unique_id,
             )
         color_timeline = _color_timeline(segments, float(fps))
+        # Keep an unbaked copy for the preview strip even when stitch skips color bake.
+        strip_timeline = [dict(item) for item in color_timeline]
+        # Per-clip grading targets the AI timeline only; skip when we prepend
+        # an external original + RIFE bridge.
+        if do_stitch and _timeline_has_color(color_timeline):
+            _LOG.info(
+                "Disk Final Decode: skipping color timeline bake while seamless "
+                "stitching original_images."
+            )
+            color_timeline = []
 
         ffmpeg = _find_ffmpeg()
 
@@ -3503,10 +4042,16 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         # MP4 blobs, so the progressive clip_by_clip path cannot consume them.
         # Always fully decode the refine layer (draft progressive path unchanged).
         effective_mode = str(cache.get("run_mode", "full_batch")) if isinstance(cache, dict) else "full_batch"
+        if do_stitch and effective_mode == "clip_by_clip":
+            _LOG.info(
+                "Disk Final Decode: original_images connected — forcing full_batch "
+                "export so the seamless stitch can run."
+            )
+            effective_mode = "full_batch"
         if str(selected_layer or "") == "refine":
             # Reuse a previously decoded refine preview when present so Save
             # Preview / reload do not pay the H3 VAE cost again.
-            if _refine_preview_cache_ready(manifest, data_path):
+            if (not do_stitch) and _refine_preview_cache_ready(manifest, data_path):
                 committed = _decoded_preview_cache_path(data_path)
                 _LOG.info(
                     "Disk Final Decode: reusing cached refine preview %s",
@@ -3537,6 +4082,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                             "preview_frames": int(total_frames),
                             "total_clips": int(len(segments)),
                             "cache_mode": "committed_refine_preview",
+                            "active_layer": "refine",
                             "color_timeline": color_timeline,
                             "color_preview_baked": False,
                             "output": str(autosave_path) if autosave_path else "",
@@ -3586,6 +4132,23 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             total_duration = float(total_frames / float(fps))
             size = _cache_size_mb(data_path, manifest_path)
             item = _comfy_media_item(preview_path, fps, "temp")
+
+            # Persist the currently shown draft preview (validated prefix +
+            # unvalidated candidate) so lowres toggle can light up green and
+            # survive reload without another VAE pass.
+            try:
+                manifest, _committed = _persist_layer_preview_cache(
+                    data_path,
+                    manifest_path,
+                    manifest,
+                    preview_path,
+                )
+            except Exception as exc:
+                _LOG.warning(
+                    "Disk Final Decode: failed to persist draft preview cache: %s",
+                    exc,
+                )
+
             progress.finish()
             status_shift = (
                 f"full_preview_cached_{len(segments)}_clips_shift_{int(seam_shift)}"
@@ -3604,6 +4167,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                         "cache_mode": str(preview_cache_mode),
                         "preview_frames": int(preview_frames),
                         "total_clips": int(len(segments)),
+                        "active_layer": str(selected_layer or "draft"),
                         "autosave_path": str(autosave_path),
                         "color_timeline": color_timeline,
                         "color_preview_baked": False,
@@ -3617,12 +4181,17 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         expected_frames = int(manifest["final_frame_count"])
         decode_units = max(1, len(segments) - 1)
         progress = _FinalDecodeNativeProgress(
-            unique_id, total=4 + (2 * decode_units) + (1 if _timeline_has_color(color_timeline) else 0)
+            unique_id,
+            total=4
+            + (2 * decode_units)
+            + (1 if _timeline_has_color(color_timeline) else 0)
+            + (1 if do_stitch else 0),
         )
         seam_shifts = {}
         written_frames = 0
         video_proc = None
         video_log_f = None
+        ai_image_parts = [] if do_stitch else None
 
         # Temp artifacts are one set only and are always removed afterwards.
         temp_root = _ensure_cache_root()
@@ -3635,8 +4204,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         color_temp = temp_root / f"_export_{token}_color.{extension}"
 
         try:
-            # VIDEO - strict constant-memory path: one clip for N=1, otherwise
-            # exactly one adjacent pair per seam. Nothing accumulated in IMAGE.
+            # VIDEO - strict constant-memory path unless original_images stitch
+            # needs the full AI IMAGE batch for SeamlessVideoStitcher.
             if len(segments) == 1:
                 v = _maybe_upscale_segment_video(
                     _load_segment_video(data_path, segments[0])
@@ -3650,13 +4219,18 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     raise RuntimeError(
                         f"Disk Final Decode: VAE returned {decoded.shape[0]}, expected {expected0}."
                     )
-                h, w = int(decoded.shape[1]), int(decoded.shape[2])
-                video_proc, video_log_f = _start_video_encoder(
-                    ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
-                )
-                _write_image_frames(video_proc, decoded)
-                written_frames = int(decoded.shape[0])
-                del decoded, v
+                if do_stitch:
+                    ai_image_parts.append(_cpu_image_chunk(decoded))
+                    written_frames = int(decoded.shape[0])
+                    del decoded, v
+                else:
+                    h, w = int(decoded.shape[1]), int(decoded.shape[2])
+                    video_proc, video_log_f = _start_video_encoder(
+                        ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
+                    )
+                    _write_image_frames(video_proc, decoded)
+                    written_frames = int(decoded.shape[0])
+                    del decoded, v
             else:
                 for i in range(1, len(segments)):
                     chain, meta = _build_pair_video(data_path, segments[i - 1], segments[i])
@@ -3666,31 +4240,93 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     progress.advance()
                     seam_shifts[i] = int(shift)
 
-                    if video_proc is None:
-                        h, w = int(previous_raw.shape[1]), int(previous_raw.shape[2])
-                        video_proc, video_log_f = _start_video_encoder(
-                            ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
-                        )
-                        # First pair supplies clip 1 exactly once.
-                        _write_image_frames(video_proc, previous_raw)
-                        written_frames += int(previous_raw.shape[0])
+                    if do_stitch:
+                        if not ai_image_parts:
+                            ai_image_parts.append(_cpu_image_chunk(previous_raw))
+                            written_frames += int(previous_raw.shape[0])
+                        current_out = _correct_current_segment(previous_raw, current_raw)
+                        ai_image_parts.append(_cpu_image_chunk(current_out))
+                        written_frames += int(current_out.shape[0])
+                        del current_out, previous_raw, current_raw, decoded
+                    else:
+                        if video_proc is None:
+                            h, w = int(previous_raw.shape[1]), int(previous_raw.shape[2])
+                            video_proc, video_log_f = _start_video_encoder(
+                                ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
+                            )
+                            # First pair supplies clip 1 exactly once.
+                            _write_image_frames(video_proc, previous_raw)
+                            written_frames += int(previous_raw.shape[0])
 
-                    current_out = _correct_current_segment(previous_raw, current_raw)
-                    _write_image_frames(video_proc, current_out)
-                    written_frames += int(current_out.shape[0])
-                    del current_out, previous_raw, current_raw, decoded
+                        current_out = _correct_current_segment(previous_raw, current_raw)
+                        _write_image_frames(video_proc, current_out)
+                        written_frames += int(current_out.shape[0])
+                        del current_out, previous_raw, current_raw, decoded
 
-            if video_proc is None or video_log_f is None:
-                raise RuntimeError("Disk Final Decode: encoder never started.")
-            _finish_process(video_proc, video_log_f, video_log, "Disk Final Decode encoder")
-            progress.advance()
-            video_proc = None
-            video_log_f = None
-
-            if int(written_frames) != int(expected_frames):
-                raise RuntimeError(
-                    f"Disk Final Decode wrote {written_frames} frames, expected {expected_frames}."
+            if do_stitch:
+                if not ai_image_parts:
+                    raise RuntimeError("Disk Final Decode: stitch path collected no AI frames.")
+                if int(written_frames) != int(expected_frames):
+                    raise RuntimeError(
+                        f"Disk Final Decode collected {written_frames} AI frames, "
+                        f"expected {expected_frames}."
+                    )
+                ai_images = (
+                    ai_image_parts[0]
+                    if len(ai_image_parts) == 1
+                    else torch.cat(ai_image_parts, dim=0)
                 )
+                del ai_image_parts
+                from .stitch_bridge import stitch_original_with_ai
+
+                stitched, bridge = stitch_original_with_ai(
+                    original_images,
+                    ai_images,
+                    ref_frames_offset=int(ref_frames_offset),
+                    rife_multiplier=int(rife_multiplier),
+                    rife_ckpt=rife_ckpt,
+                    fast_mode=bool(rife_fast_mode),
+                    ensemble=bool(rife_ensemble),
+                    ai_skip_first=int(ai_skip_first),
+                )
+                progress.advance()
+                del ai_images
+                original_kept = int(original_images.shape[0]) - int(ref_frames_offset)
+                bridge_frames = int(bridge.shape[0])
+                stitch_meta = {
+                    "original_kept": int(original_kept),
+                    "bridge": int(bridge_frames),
+                    "ai_skip_first": int(ai_skip_first),
+                    "total_frames": int(stitched.shape[0]),
+                    "fps": float(fps),
+                    "bridge_start_frame": int(original_kept),
+                    "bridge_end_frame": int(original_kept + bridge_frames),
+                }
+                del bridge
+                h, w = int(stitched.shape[1]), int(stitched.shape[2])
+                video_proc, video_log_f = _start_video_encoder(
+                    ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
+                )
+                _write_image_frames(video_proc, stitched)
+                written_frames = int(stitched.shape[0])
+                expected_frames = int(stitched.shape[0])
+                del stitched
+                _finish_process(video_proc, video_log_f, video_log, "Disk Final Decode encoder")
+                progress.advance()
+                video_proc = None
+                video_log_f = None
+            else:
+                if video_proc is None or video_log_f is None:
+                    raise RuntimeError("Disk Final Decode: encoder never started.")
+                _finish_process(video_proc, video_log_f, video_log, "Disk Final Decode encoder")
+                progress.advance()
+                video_proc = None
+                video_log_f = None
+
+                if int(written_frames) != int(expected_frames):
+                    raise RuntimeError(
+                        f"Disk Final Decode wrote {written_frames} frames, expected {expected_frames}."
+                    )
 
             # AUDIO - build the SAME primary per-clip PCM cache as Clip by Clip,
             # then assemble the final Full Batch timeline through the exact same
@@ -3787,6 +4423,14 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 raw_audio,
                 f"{token}_full_pcm",
             )
+            if stitch_meta is not None:
+                sample_rate, channels, written_samples = _rewrite_raw_audio_for_seamless_stitch(
+                    raw_audio,
+                    sample_rate,
+                    channels,
+                    fps,
+                    stitch_meta,
+                )
 
             _mux_final(
                 ffmpeg,
@@ -3813,27 +4457,28 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 os.replace(color_temp, output_path)
                 progress.advance()
 
-            # Keep a durable decoded preview next to refine (and any full_batch
-            # layer decode) so the next Final Decode / browser restore can skip
-            # the heavy H3 VideoVAE pass.
-            if str(selected_layer or "") == "refine" or str(Path(data_path).name).endswith(
-                ".refine.h3cache"
-            ):
+            # Keep a durable decoded preview next to the active layer cache so
+            # lowres/refined toggle dots stay green and reload can skip VAE.
+            # Stitched exports prepend an external original, so do not overwrite
+            # the AI-only committed preview cache with that longer timeline.
+            if stitch_meta is None:
                 try:
                     video_only = None
-                    # temp_video is the pre-mux video elementary stream used above.
                     if "temp_video" in locals() and Path(temp_video).exists():
                         video_only = temp_video
+                    # Prefer the browser-facing muxed preview when present.
+                    persist_src = preview_path if Path(preview_path).exists() else output_path
                     manifest, _committed = _persist_layer_preview_cache(
                         data_path,
                         manifest_path,
                         manifest,
-                        output_path,
+                        persist_src,
                         source_video_mp4=video_only,
                     )
                 except Exception as exc:
                     _LOG.warning(
-                        "Disk Final Decode: failed to persist refine preview cache: %s",
+                        "Disk Final Decode: failed to persist %s preview cache: %s",
+                        selected_layer or "draft",
                         exc,
                     )
 
@@ -3843,23 +4488,36 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             size = _cache_size_mb(data_path, manifest_path)
             duration = float(expected_frames / float(fps))
             _LOG.info(
-                "H3 Disk Final Decode: clips=%d frames=%d duration=%.3fs output=%s",
-                len(segments), expected_frames, duration, output_path,
+                "H3 Disk Final Decode: clips=%d frames=%d duration=%.3fs stitch=%s output=%s",
+                len(segments),
+                expected_frames,
+                duration,
+                "yes" if stitch_meta is not None else "no",
+                output_path,
             )
 
             item = _comfy_media_item(preview_path, fps, "temp")
             progress.finish()
 
+            ui_timeline = strip_timeline
+            stitch_ui = None
+            if stitch_meta is not None:
+                ui_timeline = _shift_timeline_for_stitch(strip_timeline, stitch_meta, fps)
+                stitch_ui = dict(stitch_meta)
+
             return {
                 "ui": {
                     "h3_video": [item],
                     "h3_preview_info": [{
-                        "mode": "full_batch",
+                        "mode": "full_batch_stitch" if stitch_meta is not None else "full_batch",
                         "clip": int(len(segments)),
                         "preview_frames": int(expected_frames),
                         "total_clips": int(len(segments)),
-                        "color_timeline": color_timeline,
+                        "active_layer": str(selected_layer or "draft"),
+                        "color_timeline": ui_timeline,
                         "color_preview_baked": False,
+                        "seamless_stitch": bool(stitch_meta is not None),
+                        "stitch": stitch_ui,
                     }],
                 },
                 "result": (),

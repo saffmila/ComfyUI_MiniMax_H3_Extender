@@ -59,6 +59,7 @@ from .motion_context_disk import (
     _DATA_START,
     _chain_paths,
     _clear_refine_sidecar,
+_invalidate_refine_from_index,
     _decoded_audio_cache_path,
     _decoded_audio_cache_end,
     _decoded_preview_cache_path,
@@ -94,7 +95,7 @@ from .fl2va_engine import (
     install_fl2va_project_continuity,
 )
 
-BUILD = "minimax-h3-extender-v2.2.0-latent-refine"
+BUILD = "minimax-h3-extender-v2.2.1-latent-refine"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -1220,9 +1221,23 @@ def _prepare_shared_refs(
     total_ref_video_frames = 0
     for video_index, (slot, video_frames, source_fps, soundtrack) in enumerate(active_videos):
         frames_24 = _resample_ref_video_to_h3_fps(video_frames, source_fps, f"ref_video_{slot}")
-        if int(frames_24.shape[0]) < int(2 * FPS):
+        min_ref_frames = int(2 * FPS)
+        n24 = int(frames_24.shape[0])
+        if n24 < 1:
             raise ValueError(
-                f"MiniMax H3 Extender: ref_video_{slot} is shorter than MiniMax H3's 2-second minimum at 24 fps."
+                f"MiniMax H3 Extender: ref_video_{slot} has no frames after 24 fps resample."
+            )
+        if n24 < min_ref_frames:
+            # Prefer completing the run over rejecting short refs. Repeat the last
+            # frame so H3 still sees a 2s @ 24 fps reference timeline.
+            pad = min_ref_frames - n24
+            frames_24 = torch.cat([frames_24, frames_24[-1:].repeat(pad, 1, 1, 1)], dim=0)
+            logging.warning(
+                "MiniMax H3 Extender: ref_video_%s is %.2fs at 24 fps (< 2.00s); "
+                "padded %d frame(s) by repeating the last frame.",
+                slot,
+                float(n24) / float(FPS),
+                int(pad),
             )
 
         vh, vw = int(frames_24.shape[1]), int(frames_24.shape[2])
@@ -1656,6 +1671,20 @@ def _apply_per_clip_loras(owner, model, clip, lora_cfgs, clip_index):
     return patched_model, clip
 
 
+def _coerce_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+    return bool(default)
+
+
 def _default_clip(index: int = 0):
     return {
         "id": f"clip_{index + 1}",
@@ -1665,6 +1694,7 @@ def _default_clip(index: int = 0):
         "seed_mode": "randomize",
         "duration": DEFAULT_DURATION,
         "validated": False,
+        "refine_validated": False,
         "color_adjustment": _normalize_color_adjustment(),
         "loras": [],
         "first_frame": None,
@@ -1721,6 +1751,7 @@ def _parse_clips_json(value: str, generation_mode="ref2va"):
                 "seed_mode": seed_mode,
                 "duration": duration,
                 "validated": bool(raw.get("validated", False)),
+                "refine_validated": bool(raw.get("refine_validated", False)),
                 "color_adjustment": _normalize_color_adjustment(raw.get("color_adjustment")),
                 "loras": _normalize_clip_loras(raw.get("loras"), legacy=raw.get("lora")),
                 "first_frame": _normalize_ref_descriptor(raw.get("first_frame")),
@@ -1742,6 +1773,12 @@ def _parse_clips_json(value: str, generation_mode="ref2va"):
             if found_open:
                 clip["validated"] = False
             elif not clip["validated"]:
+                found_open = True
+        found_open = False
+        for clip in out:
+            if found_open:
+                clip["refine_validated"] = False
+            elif not clip["refine_validated"]:
                 found_open = True
 
     return out
@@ -2919,7 +2956,13 @@ class MiniMaxH3Extender:
             ),
             "clip": ("CLIP",),
             "vae": ("VAE",),
-            "run_mode": (["clip_by_clip", "full_batch"], {"default": "clip_by_clip"}),
+            "run_mode": (
+                ["clip_by_clip", "full_batch"],
+                {
+                    "default": "clip_by_clip",
+                    "tooltip": "Applies to draft generation and to run_refine. clip_by_clip processes the next open card then stops; full_batch walks the whole plan.",
+                },
+            ),
             "width": (
                 "INT",
                 {
@@ -3022,7 +3065,7 @@ class MiniMaxH3Extender:
                 "BOOLEAN",
                 {
                     "default": False,
-                    "tooltip": "When True, keep the draft cache and run a second pass: neural latent upscale + resample with refine_denoise. Requires a complete draft and latent_upscale_model.",
+                    "tooltip": "When True, keep the draft cache and run a second pass: neural latent upscale + resample with refine_denoise. Canvas size is ignored (draft geometry + refine_megapixels). Honors run_mode and refine Validated prefix. Refines the drafted prefix (clip_by_clip can refine clip 1 before the rest exist). Requires latent_upscale_model.",
                 },
             ),
             "latent_upscale_model": (
@@ -3635,6 +3678,7 @@ class MiniMaxH3Extender:
         **kwargs,
     ):
         generation_mode = _normalize_generation_mode(generation_mode)
+        run_refine = _coerce_bool(run_refine, False)
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
         clips = _parse_clips_json(clips_json, generation_mode)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
@@ -3750,21 +3794,42 @@ class MiniMaxH3Extender:
         previous_cache_resolution = dict(cache_resolution) if requested_mismatch else None
 
         if requested_mismatch:
-            # Resolution is the one unavoidable global invalidation: latent
-            # geometry cannot be mixed inside one sequential disk chain.
-            manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
-            segments = []
-            cache_resolution = None
-            cache_has_segments = False
-            resolution["cache_reset"] = True
-            for cfg in clips:
-                cfg["validated"] = False
-            try:
-                preview_path = _decoded_preview_cache_path(data_path)
-                if preview_path.exists():
-                    preview_path.unlink()
-            except Exception:
-                pass
+            if bool(run_refine):
+                # Refine input is draft geometry; output size comes from
+                # refine_megapixels. Canvas/Auto size only applies to draft
+                # generation, so ignore a mismatch instead of blocking or
+                # wiping the draft the user is trying to refine.
+                resolution["width"] = int(cache_resolution["width"])
+                resolution["height"] = int(cache_resolution["height"])
+                resolved_width = int(resolution["width"])
+                resolved_height = int(resolution["height"])
+                previous_cache_resolution = None
+                logging.info(
+                    "run_refine: ignoring Canvas %sx%s; using draft cache %sx%s "
+                    "(target size from refine_megapixels)",
+                    int(requested_resolution["width"]),
+                    int(requested_resolution["height"]),
+                    resolved_width,
+                    resolved_height,
+                )
+            else:
+                # Resolution is the one unavoidable global invalidation: latent
+                # geometry cannot be mixed inside one sequential disk chain.
+                manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
+                segments = []
+                cache_resolution = None
+                cache_has_segments = False
+                resolution["cache_reset"] = True
+                for cfg in clips:
+                    cfg["validated"] = False
+                    cfg["refine_validated"] = False
+                _clear_refine_sidecar(data_path)
+                try:
+                    preview_path = _decoded_preview_cache_path(data_path)
+                    if preview_path.exists():
+                        preview_path.unlink()
+                except Exception:
+                    pass
 
         if prompt_pack_imported and external_prompt_pack is not None:
             imported_json = _state_json(clips, active_prompt_pack_signature, "ref2va")
@@ -3848,7 +3913,14 @@ class MiniMaxH3Extender:
                 raise ValueError(
                     "MiniMax H3 Extender: run_refine needs an existing draft cache."
                 )
-            run_refine_pass(
+            draft_n = len((current_manifest or {}).get("segments") or [])
+            if draft_n < 1:
+                raise ValueError(
+                    "MiniMax H3 Extender: Run refine pass is ON, but draft cache "
+                    "is empty. Expand Latent refine, uncheck Run refine pass, "
+                    "Queue to generate draft, then enable refine again."
+                )
+            refine_result = run_refine_pass(
                 owner=owner,
                 data_path=data_path,
                 draft_manifest=current_manifest,
@@ -3887,9 +3959,21 @@ class MiniMaxH3Extender:
                 fps=FPS,
                 send_progress=_send_extender_progress,
                 extender_self=self,
+                run_mode=str(run_mode),
             )
-            # Draft cache handle; Final Decode latent_layer=auto picks refine sidecar.
-            status = f"refined {len(clips)} clip(s) | draft preserved"
+            refine_cached = int(refine_result.get("cached_count", 0))
+            refine_validated = int(refine_result.get("validated_count", 0))
+            refine_generated = list(refine_result.get("generated") or [])
+            # Draft cache handle; Final Decode latent_layer=auto picks a complete
+            # refine sidecar. Partial refine is available via latent_layer=refine.
+            status = (
+                f"refine {str(run_mode)} | cached {refine_cached}/{len(clips)} | "
+                f"validated {refine_validated} | draft preserved"
+            )
+            if refine_generated:
+                status += " | generated " + ",".join(str(i + 1) for i in refine_generated)
+            else:
+                status += " | disk only"
             previous_handle = {
                 "version": CACHE_VERSION,
                 "data_path": str(Path(data_path).resolve()),
@@ -3900,20 +3984,27 @@ class MiniMaxH3Extender:
                 "status": status,
             }
             size = _cache_size_mb(data_path, manifest_path)
-            validated_count = sum(1 for c in clips if c.get("validated"))
             _send_extender_progress(owner, -1, len(clips), "idle", status)
             ui_state = {
-                "clips_json": _state_json(clips),
+                "generation_mode": "ref2va",
+                "clips_json": _state_json(clips, active_prompt_pack_signature, generation_mode),
+                "clip_count": len(clips),
+                "cached_count": refine_cached,
+                "validated_count": refine_validated,
+                "refine_cached_count": refine_cached,
+                "refine_validated_count": refine_validated,
+                "generated": [i + 1 for i in refine_generated],
                 "status": status,
                 "build": BUILD,
                 "refined": True,
+                "run_refine": True,
             }
             return {
                 "ui": {"h3_extender_state": [ui_state]},
                 "result": (
                     previous_handle,
                     int(len(clips)),
-                    int(validated_count),
+                    int(refine_validated),
                     status,
                     float(size),
                     BUILD,
@@ -4083,8 +4174,11 @@ class MiniMaxH3Extender:
                 f"Rendering clip {i + 1}/{len(clips)}",
             )
 
-            # Draft rewrite invalidates any previous refine sidecar.
-            _clear_refine_sidecar(data_path)
+            # Draft rewrite of clip i invalidates refine from i onward, but keeps
+            # an already refined prefix intact for interleaved clip_by_clip work.
+            _invalidate_refine_from_index(data_path, i)
+            for j in range(i, len(clips)):
+                clips[j]["refine_validated"] = False
 
             sampled = _sample_h3(
                 clip_model,

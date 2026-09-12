@@ -402,6 +402,15 @@ Then run:
 
 Restart ComfyUI after installation.
 
+### Optional — Seamless stitch with an existing video
+
+Final Decode accepts an optional `original_images` IMAGE input (e.g. from Load Video).
+
+- **Disconnected:** Extender behaves exactly as before. `Comfyui-MinimaxUtils` is not required.
+- **Connected:** soft-calls **Seamless Video Stitcher (RIFE)** from [Comfyui-MinimaxUtils](https://github.com/) + [ComfyUI-Frame-Interpolation](https://github.com/Fannovel16/ComfyUI-Frame-Interpolation), then exports `original[:cut] + RIFE bridge + AI` as the normal Final Decode mp4/preview.
+
+Also install Frame-Interpolation RIFE weights when you use this path. Video-only for now (original track is silent; AI audio starts after the bridge). Ref2VA full-batch only.
+
 ### ℹ️ About the old Disk Join nodes
 
 The old low-level **Motion Context Disk Join** workflow is now considered **deprecated** and is no longer actively maintained.

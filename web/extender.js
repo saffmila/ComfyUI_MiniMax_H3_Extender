@@ -570,6 +570,7 @@ function newClip(index) {
         seed_mode: "randomize",
         duration: 10.0,
         validated: false,
+        refine_validated: false,
         color_adjustment: normalizeColorAdjustment(),
         loras: [],
         first_frame: null,
@@ -590,6 +591,7 @@ function normalizeClipList(rawClips) {
             : "randomize",
         duration: Math.max(0.25, Math.min(150, Number(c?.duration || 10))),
         validated: Boolean(c?.validated),
+        refine_validated: Boolean(c?.refine_validated),
         color_adjustment: normalizeColorAdjustment(c?.color_adjustment),
         loras: normalizeClipLoras(c?.loras, c?.lora),
         first_frame: normalizeRefDescriptor(c?.first_frame),
@@ -827,16 +829,28 @@ async function refreshLoraNames(node, runtime) {
     }
 }
 
-function validatedPrefixFromState(state) {
-    if (state?.generation_mode === "fl2va") {
+function validatedPrefixFromState(state, refineMode = false) {
+    if (!refineMode && state?.generation_mode === "fl2va") {
         return (state?.clips || []).filter((clip) => Boolean(clip?.validated)).length;
     }
     let count = 0;
     for (const clip of state?.clips || []) {
-        if (!clip?.validated) break;
+        const ok = refineMode ? Boolean(clip?.refine_validated) : Boolean(clip?.validated);
+        if (!ok) break;
         count += 1;
     }
     return count;
+}
+
+function isRefineUiActive(runtime) {
+    return coerceWidgetBool(runtime?.runRefineWidget?.value);
+}
+
+function invalidateFrom(state, index, refineMode = false) {
+    for (let i = Math.max(0, index); i < state.clips.length; i++) {
+        if (refineMode) state.clips[i].refine_validated = false;
+        else state.clips[i].validated = false;
+    }
 }
 
 async function restoreCacheState(node, runtime) {
@@ -863,12 +877,15 @@ async function restoreCacheState(node, runtime) {
 
         runtime.cachedCount = Number(payload.cached_count || 0);
         runtime.validatedCount = Number(payload.validated_count || 0);
+        runtime.refineCachedCount = Number(payload.refine_cached_count || 0);
+        runtime.refineValidatedCount = Number(payload.refine_validated_count || 0);
         runtime.cachedClipIds = new Set(Array.isArray(payload.cached_clip_ids) ? payload.cached_clip_ids.map(String) : []);
         runtime.validatedClipIds = new Set(Array.isArray(payload.validated_clip_ids) ? payload.validated_clip_ids.map(String) : []);
         runtime.continuitySignatures = new Map(
             Object.entries(payload?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
         );
         const activeMode = String(runtime.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+        const refineMode = isRefineUiActive(runtime);
         if (activeMode === "fl2va") {
             for (const clip of runtime.state?.clips || []) {
                 clip.validated = runtime.validatedClipIds.has(String(clip.id));
@@ -876,6 +893,7 @@ async function restoreCacheState(node, runtime) {
         } else {
             for (let i = 0; i < (runtime.state?.clips || []).length; i++) {
                 runtime.state.clips[i].validated = i < runtime.validatedCount;
+                runtime.state.clips[i].refine_validated = i < runtime.refineValidatedCount;
             }
         }
         snapshotModeValidation(runtime, activeMode);
@@ -892,9 +910,9 @@ async function restoreCacheState(node, runtime) {
         const resolutionText = restoredW > 0 && restoredH > 0
             ? ` | project ${restoredW}x${restoredH}`
             : "";
-        runtime.statusText =
-            `Restored cache${resolutionText} | cached ${runtime.cachedCount}/${runtime.state.clips.length} | ` +
-            `validated ${runtime.validatedCount}`;
+        runtime.statusText = refineMode
+            ? `Restored refine${resolutionText} | cached ${runtime.refineCachedCount}/${runtime.state.clips.length} | validated ${runtime.refineValidatedCount}`
+            : `Restored cache${resolutionText} | cached ${runtime.cachedCount}/${runtime.state.clips.length} | validated ${runtime.validatedCount}`;
         syncResolutionAndInvalidate(node, runtime);
         render(node, runtime);
         node.graph?.setDirtyCanvas(true, true);
@@ -1403,6 +1421,38 @@ function setWidgetValueFromUi(widget, value) {
     }
 }
 
+function coerceWidgetBool(value) {
+    if (value === true || value === 1) return true;
+    if (value === false || value === 0 || value == null) return false;
+    if (typeof value === "string") {
+        const s = value.trim().toLowerCase();
+        if (s === "true" || s === "1" || s === "yes" || s === "on") return true;
+        if (s === "false" || s === "0" || s === "no" || s === "off" || s === "") return false;
+    }
+    return Boolean(value);
+}
+
+function syncRunRefineWidgetFromUi(runtime) {
+    if (!runtime?.runRefineWidget) return false;
+    const input = runtime.runRefineRow?.__h3Input;
+    if (input) {
+        const checked = Boolean(input.checked);
+        runtime.runRefineWidget.value = checked;
+        return checked;
+    }
+    return coerceWidgetBool(runtime.runRefineWidget.value);
+}
+
+function updateRefineSectionTitle(runtime) {
+    const section = runtime?.refineSection;
+    if (!section?.__h3Chevron) return;
+    const label = section.querySelector(".h3-ext-section-head span:last-child");
+    if (!label) return;
+    const on = coerceWidgetBool(runtime.runRefineWidget?.value);
+    label.textContent = on ? "Latent refine (ON)" : "Latent refine";
+    label.style.color = on ? "rgba(140, 210, 155, 0.95)" : "";
+}
+
 function createBoundSelectRow(labelText, widget, values, labelMap = null) {
     const row = document.createElement("div");
     row.className = "h3-ext-row";
@@ -1461,8 +1511,12 @@ function createBoundCheckboxRow(labelText, widget) {
     label.textContent = labelText;
     const input = document.createElement("input");
     input.type = "checkbox";
-    input.checked = Boolean(widget?.value);
-    input.addEventListener("change", () => setWidgetValueFromUi(widget, Boolean(input.checked)));
+    input.checked = coerceWidgetBool(widget?.value);
+    input.addEventListener("change", () => {
+        setWidgetValueFromUi(widget, Boolean(input.checked));
+        // Keep LiteGraph + Nodes 2.0 serialization in lockstep with the custom UI.
+        if (widget) widget.value = Boolean(input.checked);
+    });
     row.append(label, input);
     row.__h3Input = input;
     row.__h3Widget = widget;
@@ -1525,7 +1579,7 @@ function syncExtenderSections(node, runtime) {
     for (const row of runtime.pddDetailRows || []) {
         row.style.display = pddActive ? "flex" : "none";
     }
-    const refineOn = Boolean(runtime.runRefineWidget?.value);
+    const refineOn = coerceWidgetBool(runtime.runRefineWidget?.value);
     for (const row of runtime.refineDetailRows || []) {
         row.style.display = refineOn ? "flex" : "none";
     }
@@ -1539,10 +1593,11 @@ function syncExtenderSections(node, runtime) {
         if (!widget) continue;
         if (row.__h3Select) row.__h3Select.value = String(widget.value ?? "");
         if (row.__h3Input) {
-            if (row.__h3Input.type === "checkbox") row.__h3Input.checked = Boolean(widget.value);
+            if (row.__h3Input.type === "checkbox") row.__h3Input.checked = coerceWidgetBool(widget.value);
             else row.__h3Input.value = String(widget.value ?? "");
         }
     }
+    updateRefineSectionTitle(runtime);
     const mode = String(runtime.resolutionModeWidget?.value || "auto_from_ref");
     if (runtime.megapixelsRow) {
         // Megapixels only drives Auto; keep the control visible but quieter in Manual.
@@ -1613,10 +1668,11 @@ function buildExtenderSections(node, runtime) {
 
     const refineSection = createCollapsibleSection("Latent refine", {
         open: false,
-        hint: "Second pass: keep draft, neural latent upscale + resample. Then Queue Final Decode.",
+        hint: "Second pass: keep draft, neural latent upscale + resample. Uses the same run_mode + Validated prefix as draft. Then Queue Final Decode.",
     });
     refineSection.__h3Runtime = runtime;
     const runRefineRow = createBoundCheckboxRow("Run refine pass", runtime.runRefineWidget);
+    runtime.runRefineRow = runRefineRow;
     const upscaleModelRow = createBoundSelectRow("Upscale model", runtime.latentUpscaleModelWidget);
     const refineMpRow = createBoundNumberRow("Refine megapixels", runtime.refineMegapixelsWidget, {
         min: 0.1, max: 8, step: 0.1,
@@ -1667,6 +1723,8 @@ function buildExtenderSections(node, runtime) {
     );
     runRefineRow.__h3Input?.addEventListener("change", () => {
         syncExtenderSections(node, runtime);
+        render(node, runtime);
+        node.graph?.setDirtyCanvas(true, true);
         requestAnimationFrame(() => syncDomHeight(node, runtime, true));
     });
 
@@ -1705,12 +1763,6 @@ function obviouslyPoisonedHeight(height, minimumHeight) {
     return h > Math.max(1800, Number(minimumHeight || 0) * 3);
 }
 
-function invalidateFrom(state, index) {
-    for (let i = Math.max(0, index); i < state.clips.length; i++) {
-        state.clips[i].validated = false;
-    }
-}
-
 function currentResolutionFromWidgets(node) {
     const width = Number(getWidget(node, "width")?.value || 0);
     const height = Number(getWidget(node, "height")?.value || 0);
@@ -1730,23 +1782,30 @@ function invalidateForResolutionChange(node, runtime) {
     if (current.width === expectedW && current.height === expectedH) return false;
 
     const hadValidated = runtime.state.clips.some((clip) => Boolean(clip?.validated));
+    const hadRefineValidated = runtime.state.clips.some((clip) => Boolean(clip?.refine_validated));
     const hadCached = Number(runtime.cachedCount || 0) > 0;
+    const hadRefineCached = Number(runtime.refineCachedCount || 0) > 0;
 
     // Once the requested geometry differs from the cache/project geometry,
     // every latent in that chain is incompatible. Reflect that immediately in
     // the cards instead of waiting for the backend to discover it at Queue.
-    for (const clip of runtime.state.clips) clip.validated = false;
+    for (const clip of runtime.state.clips) {
+        clip.validated = false;
+        clip.refine_validated = false;
+    }
     runtime.validatedCount = 0;
     runtime.cachedCount = 0;
+    runtime.refineValidatedCount = 0;
+    runtime.refineCachedCount = 0;
     runtime.resolutionInvalidated = true;
     runtime.statusText =
         `Resolution changed: ${expectedW}x${expectedH} → ${current.width}x${current.height} | ` +
         `clips invalidated; cache resets on next run`;
 
-    if (hadValidated || hadCached) updateHidden(node, runtime);
+    if (hadValidated || hadCached || hadRefineValidated || hadRefineCached) updateHidden(node, runtime);
     render(node, runtime);
     node.graph?.setDirtyCanvas(true, true);
-    return hadValidated || hadCached;
+    return hadValidated || hadCached || hadRefineValidated || hadRefineCached;
 }
 
 function syncResolutionAndInvalidate(node, runtime) {
@@ -1776,17 +1835,23 @@ function advanceSeedAfterGenerate(clip) {
 function cardStatus(runtime, clip, index) {
     if (
         Number(runtime.activeClipIndex) === index &&
-        ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""))
+        ["preparing", "sampling", "complete", "refining"].includes(String(runtime.activePhase || ""))
     ) {
         return "rendering";
     }
 
+    const refineMode = isRefineUiActive(runtime);
     const fl2va = runtime.state?.generation_mode === "fl2va";
-    const cached = fl2va
-        ? runtime.cachedClipIds?.has(String(clip.id))
-        : index < Number(runtime.cachedCount || 0);
-    if (clip.validated && cached) return "validated";
-    const firstOpen = runtime.state.clips.findIndex((c) => !c.validated);
+    const cached = refineMode
+        ? index < Number(runtime.refineCachedCount || 0)
+        : fl2va
+            ? runtime.cachedClipIds?.has(String(clip.id))
+            : index < Number(runtime.cachedCount || 0);
+    const isValidated = refineMode ? Boolean(clip.refine_validated) : Boolean(clip.validated);
+    if (isValidated && cached) return "validated";
+    const firstOpen = (runtime.state.clips || []).findIndex((c) =>
+        refineMode ? !c.refine_validated : !c.validated
+    );
     if (index === firstOpen) return cached ? "candidate" : "current";
     if (cached) return "cached";
     return "future";
@@ -3756,36 +3821,55 @@ function render(node, runtime) {
         foot.style.alignItems = "center";
         foot.style.justifyContent = "space-between";
         foot.style.marginTop = "9px";
+        foot.style.gap = "8px";
 
-        const validateLabel = document.createElement("label");
-        validateLabel.style.display = "flex";
-        validateLabel.style.alignItems = "center";
-        validateLabel.style.gap = "6px";
-        validateLabel.style.cursor = "pointer";
-        const validated = document.createElement("input");
-        validated.type = "checkbox";
-        validated.checked = clip.validated;
-        validated.addEventListener("change", () => {
-            if (fl2vaMode) {
-                // FL2VA plans are independent: validation is per card and never
-                // forces later plans open.
-                clip.validated = Boolean(validated.checked);
-            } else {
-                if (validated.checked) {
-                    clip.validated = true;
-                } else {
-                    invalidateFrom(state, index);
-                }
-                let open = false;
-                for (const c of state.clips) {
-                    if (open) c.validated = false;
-                    else if (!c.validated) open = true;
-                }
-            }
-            updateHidden(node, runtime);
-            render(node, runtime);
-        });
-        validateLabel.append(validated, document.createTextNode("Validated"));
+        const validationRow = document.createElement("div");
+        validationRow.style.display = "flex";
+        validationRow.style.alignItems = "center";
+        validationRow.style.gap = "8px";
+        validationRow.style.flexWrap = "wrap";
+        validationRow.style.minWidth = "0";
+
+        const validationTitle = document.createElement("span");
+        validationTitle.textContent = "Validation:";
+        validationTitle.style.fontSize = "10px";
+        validationTitle.style.opacity = "0.72";
+        validationTitle.style.flex = "0 0 auto";
+        validationRow.appendChild(validationTitle);
+
+        if (fl2vaMode) {
+            // FL2VA plans are independent: one validation flag per card.
+            validationRow.appendChild(makeValidationCheckbox("Draft", clip.validated, (checked) => {
+                clip.validated = checked;
+                updateHidden(node, runtime);
+                render(node, runtime);
+            }));
+        } else {
+            // REF2VA keeps separate draft/refine prefixes. Both are always visible
+            // so clip_by_clip users can lock draft N and refine N without flipping
+            // Run refine pass just to reach the other checkbox.
+            const hasRefineCache = Number(runtime.refineCachedCount || 0) > 0
+                || Boolean(runtime.runRefineWidget?.value)
+                || (state.clips || []).some((c) => Boolean(c?.refine_validated));
+            validationRow.appendChild(makeValidationCheckbox("Draft", clip.validated, (checked) => {
+                if (checked) clip.validated = true;
+                else invalidateFrom(state, index, false);
+                enforceValidatedPrefix(state.clips, "validated");
+                updateHidden(node, runtime);
+                render(node, runtime);
+            }));
+            const refineBox = makeValidationCheckbox("Refine", clip.refine_validated, (checked) => {
+                if (checked) clip.refine_validated = true;
+                else invalidateFrom(state, index, true);
+                enforceValidatedPrefix(state.clips, "refine_validated");
+                updateHidden(node, runtime);
+                render(node, runtime);
+            });
+            // Dim when refine has never been used, but keep it clickable so the
+            // user always sees both locks side by side.
+            if (!hasRefineCache) refineBox.style.opacity = "0.55";
+            validationRow.appendChild(refineBox);
+        }
 
         const info = document.createElement("span");
         const rawFrames = Math.max(5, Math.round(clip.duration * 24));
@@ -3794,11 +3878,36 @@ function render(node, runtime) {
         info.textContent = `${aligned}f / ${(aligned / 24).toFixed(3)}s`;
         info.style.fontSize = "10px";
         info.style.opacity = ".65";
+        info.style.flex = "0 0 auto";
 
-        foot.append(validateLabel, info);
+        foot.append(validationRow, info);
         card.appendChild(foot);
         cards.appendChild(card);
     });
+}
+
+function enforceValidatedPrefix(clips, field = "validated") {
+    let open = false;
+    for (const clip of clips || []) {
+        if (open) clip[field] = false;
+        else if (!clip[field]) open = true;
+    }
+}
+
+function makeValidationCheckbox(labelText, checked, onChange) {
+    const wrap = document.createElement("label");
+    wrap.style.display = "inline-flex";
+    wrap.style.alignItems = "center";
+    wrap.style.gap = "4px";
+    wrap.style.cursor = "pointer";
+    wrap.style.fontSize = "10px";
+    wrap.style.userSelect = "none";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(checked);
+    input.addEventListener("change", () => onChange(Boolean(input.checked)));
+    wrap.append(input, document.createTextNode(labelText));
+    return wrap;
 }
 
 function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
@@ -4226,6 +4335,8 @@ function buildUi(node) {
         // immediately, then replace it with the authoritative disk manifest below.
         cachedCount: restoredValidatedPrefix,
         validatedCount: restoredValidatedPrefix,
+        refineCachedCount: validatedPrefixFromState(state, true),
+        refineValidatedCount: validatedPrefixFromState(state, true),
         statusText: restoredValidatedPrefix
             ? `Restoring cache | validated ${restoredValidatedPrefix}`
             : "Ready",
@@ -4521,6 +4632,27 @@ app.registerExtension({
             clearTransientRenderingState();
         });
 
+        // Custom refine checkbox can drift from the serialized widget after F5.
+        // Push the visible checkbox state into the widget right before queue.
+        const originalGraphToPrompt = app.graphToPrompt?.bind(app);
+        if (typeof originalGraphToPrompt === "function") {
+            app.graphToPrompt = async function () {
+                const graph = app.graph;
+                for (const node of graph?._nodes || []) {
+                    if (
+                        node?.comfyClass !== TARGET &&
+                        node?.type !== TARGET
+                    ) {
+                        continue;
+                    }
+                    const runtime = node.__h3Extender;
+                    if (!runtime) continue;
+                    syncRunRefineWidgetFromUi(runtime);
+                    syncExtenderSections(node, runtime);
+                }
+                return await originalGraphToPrompt(...arguments);
+            };
+        }
         api.addEventListener(PROMPT_PACK_EVENT, ({ detail }) => {
             const node = findExtenderNodeByExecutionId(detail?.node);
             if (!node) return;
@@ -4651,12 +4783,16 @@ app.registerExtension({
             }
     
             const generated = Array.isArray(info.generated) ? info.generated : [];
+            const refineRun = Boolean(info.refined || info.run_refine);
             for (const humanIndex of generated) {
                 const i = Number(humanIndex) - 1;
                 const clip = runtime.state.clips[i];
                 // Only prepare a next seed for a candidate. A validated cached
                 // clip is never touched by this automatic seed behavior.
-                if (clip && !clip.validated) {
+                const locked = refineRun
+                    ? Boolean(clip?.refine_validated)
+                    : Boolean(clip?.validated);
+                if (clip && !locked) {
                     advanceSeedAfterGenerate(clip);
                 }
             }
@@ -4667,10 +4803,19 @@ app.registerExtension({
                 updateHidden(this, runtime);
             }
 
-            runtime.cachedCount = Number(info.cached_count || 0);
-            runtime.validatedCount = Number(info.validated_count || 0);
-            runtime.cachedClipIds = new Set(Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : []);
-            runtime.validatedClipIds = new Set(Array.isArray(info.validated_clip_ids) ? info.validated_clip_ids.map(String) : []);
+            if (refineRun) {
+                runtime.refineCachedCount = Number(
+                    info.refine_cached_count ?? info.cached_count ?? 0
+                );
+                runtime.refineValidatedCount = Number(
+                    info.refine_validated_count ?? info.validated_count ?? 0
+                );
+            } else {
+                runtime.cachedCount = Number(info.cached_count || 0);
+                runtime.validatedCount = Number(info.validated_count || 0);
+                runtime.cachedClipIds = new Set(Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : []);
+                runtime.validatedClipIds = new Set(Array.isArray(info.validated_clip_ids) ? info.validated_clip_ids.map(String) : []);
+            }
             runtime.continuitySignatures = new Map(
                 Object.entries(info?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
             );
