@@ -6,6 +6,72 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+### 🆕 Motion Context OFF
+
+Ref2VA now includes a **Motion Context ON/OFF** option.
+
+With **Motion Context OFF**, clips are fully independent from each other. This means you can **insert, rerender, or invalidate any clip without invalidating the clips before or after it**, making random-access editing much more flexible.
+
+The trade-off is that there is **no continuity between clips**: each clip is generated as a separate shot, so characters, framing, camera position, motion, and scene composition are not automatically carried over from one clip to the next.
+
+Use **Motion Context ON** when you want continuous multi-clip motion and seamless progression, and **Motion Context OFF** when you prefer independent shots and easier editing.
+
+---
+
+### 🆕 Per-Clip Local References
+
+Ref2VA clips can now use their own **local Picture, Video and Audio references** in addition to the existing global references.
+
+Each clip gets a compact **Refs** panel where local references can be added, removed and previewed without cluttering the main card UI.
+
+Local references use the normal H3 slot numbering and share the same limits as global references:
+
+- up to **9 Pictures**
+- up to **3 Videos**
+- up to **3 Audio references**
+
+Global references remain global exactly as before. Local references simply use the next available slots for that clip.
+
+If a slot is already used locally, the matching global slot is automatically reserved to avoid conflicts. References coming from a Ref Pack are also handled safely without remapping or blocking generation.
+
+Local Pictures can be edited with the same image editor as global references, and local Video/Audio references include compact preview players directly inside the Refs panel.
+
+All local references are fully included in **Project Save/Load**, so they are restored automatically with the project.
+
+---
+
+### 🆕 Full Batch: Interrupt, Save & Resume
+
+Full Batch workflows are now much safer and easier to manage.
+
+You can interrupt a long Full Batch, keep the clips that are already computed, save the project, close ComfyUI, reload it later, and resume from where you stopped without losing completed work.
+
+This also works with project Save/Load, so long generations can now be split across multiple sessions instead of needing to finish in one run.
+
+Available for both **Ref2VA** and **FL2VA**.
+
+---
+
+## 🆕 News — Dynamic FL2VA Guides & Native VIDEO Output
+
+### 🎯 Dynamic Image Guides for FL2VA
+FL2VA clips can now use up to **3 independent image guides**, each placed at an exact `frame_idx`.
+
+This is based on ComfyUI's native **MiniMaxH3AddGuide** support introduced in PR [#15439](https://github.com/Comfy-Org/ComfyUI/pull/15439).
+
+You can now build a real visual timeline inside a single generation:
+
+`First → Guide 1 → Guide 2 → Guide 3 → Last`
+
+MiniMax H3 automatically generates the transitions between these visual anchors, opening the door to controlled transformations, pose changes, camera evolution, action staging and much more.
+
+### 🎬 Native VIDEO Output
+The **Final Decode / Preview** node now exposes a native ComfyUI `VIDEO` output.
+
+This makes it possible to connect the final result directly to compatible video nodes such as upscalers, post-processing pipelines and video encoders, without having to reload the generated MP4 manually.
+
+---
+
 ## 🚀 MiniMax H3 Extender 2.0.0
 
 Version **2.0.0** is now available!
@@ -19,6 +85,8 @@ Project save/load, preview restoration, clip continuity, and overall stability h
 **MiniMax H3 Extender 2.0.0** is now the new base for the project.
 
 Thanks to everyone testing, reporting issues, and helping improve the extension ❤️
+
+---
 
 ## 🎛️ New — Per-Clip LoRAs
 
@@ -235,6 +303,11 @@ Loading a project restores the clip settings and color correction state, allowin
 ---
 
 https://github.com/user-attachments/assets/a18cc6a5-2340-474e-9d3b-b784cd41584a
+
+<img width="987" height="922" alt="Capture d&#39;écran 2026-08-31 010245" src="https://github.com/user-attachments/assets/62cf39ce-5ec4-4a69-b472-3fbafa18cb81" />
+
+
+<img width="1836" height="945" alt="Capture d&#39;écran 2026-08-29 141350" src="https://github.com/user-attachments/assets/490497ef-93a0-4442-89be-fc5589491c2f" />
 
 
 <img width="2307" height="1028" alt="image" src="https://github.com/user-attachments/assets/c1126ae8-2d4b-416c-a8c2-b839cd4c6b15" />

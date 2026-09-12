@@ -5,6 +5,8 @@ const TARGET = "MiniMaxH3MotionContextDiskFinalDecode";
 const DISK_JOIN_TARGET = "MiniMaxH3MotionContextDiskJoin";
 const EXTENDER_TARGET = "MiniMaxH3Extender";
 
+let h3PreviewGraphConfiguring = false;
+
 function ensureSavePreviewButtonStyle() {
     if (document.getElementById("h3-save-preview-button-style")) return;
     const style = document.createElement("style");
@@ -84,17 +86,37 @@ function ensureSavePreviewButtonStyle() {
 }
 
 function stripFinalDecodeOutputs(node) {
-    if (!node?.outputs?.length) return;
+    if (!node) return;
 
-    // Final Decode is an OUTPUT_NODE with RETURN_TYPES=(). Old workflows can
-    // still serialize legacy sockets; strip every restored output.
-    while (node.outputs?.length) {
-        const index = node.outputs.length - 1;
+    // Old workflows may still serialize the nine historical Final Decode
+    // outputs. Since v2.1 the node intentionally exposes one native VIDEO
+    // output, so only remove legacy sockets and preserve that one.
+    let keptVideo = false;
+    for (let index = (node.outputs?.length || 0) - 1; index >= 0; index--) {
+        const output = node.outputs[index];
+        const isVideo =
+            String(output?.type || "").toUpperCase() === "VIDEO" ||
+            String(output?.name || "").toLowerCase() === "video";
+
+        if (isVideo && !keptVideo) {
+            keptVideo = true;
+            // Normalize workflows that may have restored an older label.
+            output.name = "video";
+            output.type = "VIDEO";
+            continue;
+        }
+
         if (typeof node.removeOutput === "function") {
             node.removeOutput(index);
         } else {
             node.outputs.splice(index, 1);
         }
+    }
+
+    // Defensive recovery for workflow/configure paths where LiteGraph restored
+    // legacy sockets after the Python node definition was applied.
+    if (!keptVideo && typeof node.addOutput === "function") {
+        node.addOutput("video", "VIDEO");
     }
 
     node.graph?.setDirtyCanvas(true, true);
@@ -869,6 +891,37 @@ function previewDomRenderMode(element) {
     return insideVueRow ? "nodes2" : "legacy";
 }
 
+function setLegacyPreviewWidgetFullWidth(state, enabled) {
+    const widget = state?.widget;
+    if (!widget) return;
+
+    if (enabled) {
+        if (state.legacyWidthPinInstalled) return;
+        try {
+            state.legacyWidthOwnDescriptor = Object.getOwnPropertyDescriptor(widget, "width") || null;
+            Object.defineProperty(widget, "width", {
+                configurable: true,
+                enumerable: state.legacyWidthOwnDescriptor?.enumerable ?? true,
+                get: () => undefined,
+                set: () => {},
+            });
+            state.legacyWidthPinInstalled = true;
+        } catch (_) {
+            // Best-effort workaround for the upstream Legacy DOM-widget width bug.
+        }
+        return;
+    }
+
+    if (!state.legacyWidthPinInstalled) return;
+    try {
+        const previous = state.legacyWidthOwnDescriptor;
+        if (previous) Object.defineProperty(widget, "width", previous);
+        else delete widget.width;
+    } catch (_) {}
+    state.legacyWidthPinInstalled = false;
+    state.legacyWidthOwnDescriptor = null;
+}
+
 function previewHeightIsPoisoned(height, minimumHeight) {
     const h = Number(height);
     if (!Number.isFinite(h) || h <= 0) return false;
@@ -1395,17 +1448,21 @@ function findUpstreamExtenderId(node) {
     return findUpstreamExtenderNode(node)?.id ?? null;
 }
 
+function boolValue(value, defaultValue = true) {
+    if (value === undefined || value === null || value === "") return Boolean(defaultValue);
+    if (value === false || value === 0) return false;
+    const text = String(value).trim().toLowerCase();
+    if (["false", "0", "off", "no"].includes(text)) return false;
+    if (["true", "1", "on", "yes"].includes(text)) return true;
+    return Boolean(value);
+}
+
 function upstreamGenerationMode(node) {
     const origin = findUpstreamExtenderNode(node);
 
-    // The Extender custom runtime owns the authoritative mode once its UI has
-    // been restored. Prefer it over the hidden native combo, whose default can
-    // transiently be Ref2VA during Nodes 2.0 workflow startup/refresh.
-    const runtimeMode = String(origin?.__h3Extender?.state?.generation_mode || "").toLowerCase();
-    if (runtimeMode === "fl2va" || runtimeMode === "ref2va") return runtimeMode;
-
-    // clips_json also persists the active mode. It gives us a second stable
-    // source before falling back to the native generation_mode widget.
+    // Native serialized widgets are authoritative in Nodes 2.0. Prefer them
+    // over the custom runtime so preview restore can never follow a transient
+    // UI state left over from node construction.
     const clipsWidget = (origin?.widgets || []).find((w) => w?.name === "clips_json");
     if (typeof clipsWidget?.value === "string") {
         try {
@@ -1416,7 +1473,27 @@ function upstreamGenerationMode(node) {
     }
 
     const widget = (origin?.widgets || []).find((w) => w?.name === "generation_mode");
-    return String(widget?.value || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    const widgetMode = String(widget?.value || "").toLowerCase();
+    if (widgetMode === "fl2va" || widgetMode === "ref2va") return widgetMode;
+
+    const runtimeMode = String(origin?.__h3Extender?.state?.generation_mode || "").toLowerCase();
+    return runtimeMode === "fl2va" ? "fl2va" : "ref2va";
+}
+
+function upstreamMotionContext(node) {
+    const origin = findUpstreamExtenderNode(node);
+    const clipsWidget = (origin?.widgets || []).find((w) => w?.name === "clips_json");
+    if (typeof clipsWidget?.value === "string") {
+        try {
+            const parsed = JSON.parse(clipsWidget.value);
+            if (parsed && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, "motion_context")) {
+                return boolValue(parsed.motion_context, true);
+            }
+        } catch (_) {}
+    }
+    const widget = (origin?.widgets || []).find((w) => w?.name === "motion_context");
+    if (widget) return boolValue(widget.value, true);
+    return origin?.__h3Extender?.state?.motion_context !== false;
 }
 
 function loadPreviewSource(node, state, url) {
@@ -1508,7 +1585,14 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
         const params = new URLSearchParams();
         params.set("owner_id", String(ownerId));
         params.set("final_id", String(node.id));
-        params.set("mode", upstreamGenerationMode(node));
+        const restoreMode = String(state.restoreModeOverride || upstreamGenerationMode(node)) === "fl2va"
+            ? "fl2va"
+            : "ref2va";
+        params.set("mode", restoreMode);
+        const restoreMotion = state.restoreMotionOverride == null
+            ? upstreamMotionContext(node)
+            : Boolean(state.restoreMotionOverride);
+        params.set("motion_context", restoreMotion ? "true" : "false");
 
         const response = await fetch(
             api.apiURL("/h3_extender/restored_preview?" + params.toString())
@@ -1531,14 +1615,19 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
 
         const clips = Number(payload.clip_count || 0);
         const frames = Number(payload.frame_count || 0);
-        const baseLabel =
-            `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
+        const totalClips = Number(payload.project_total_clips || clips);
+        const interrupted = Boolean(payload.interrupted);
+        const baseLabel = interrupted
+            ? `INTERRUPTED PREVIEW — ${clips}/${totalClips} clips (${frames} frames)`
+            : `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
 
         state.currentVideoInfo = { ...payload.video };
         state.currentPreviewMeta = {
             clip_count: clips,
             frame_count: frames,
-            mode: "restored",
+            mode: interrupted ? "interrupted_restored" : "restored",
+            interrupted,
+            total_clips: totalClips,
             active_layer: String(payload.active_layer || "draft"),
         };
         state.activeLayer = String(payload.active_layer || "draft") === "refine" ? "refine" : "draft";
@@ -1550,6 +1639,8 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
         state.saveButton.disabled = false;
         loadPreviewSource(node, state, mediaUrl(payload.video) + "&t=" + Date.now());
         state.restoreLoaded = true;
+        state.restoreModeOverride = null;
+        state.restoreMotionOverride = null;
 
         // Extender clip names can finish restoring a tick after Final Decode.
         setTimeout(() => {
@@ -1584,6 +1675,9 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
     }
 
     if (mode === "nodes2") {
+        // Never carry the Legacy-only width workaround into Nodes 2.0.
+        setLegacyPreviewWidgetFullWidth(state, false);
+
         const currentH = Number(node.size?.[1] || 0);
         const widgetY = Number(state.widget.last_y);
         const minH = effectivePlayerMinHeight(state);
@@ -1632,6 +1726,12 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
         state.video.style.flex = "1 1 auto";
         return;
     }
+
+    // ComfyUI frontend currently writes the right-panel host width into
+    // widget.width in Legacy mode. LiteGraph then stops falling back to the
+    // live node width and the DOM preview is clipped to roughly half the node.
+    // Keep width undefined only in Legacy so layout always follows node.size[0].
+    setLegacyPreviewWidgetFullWidth(state, true);
 
     const widgetY = Number(state.widget.last_y);
 
@@ -1740,6 +1840,7 @@ async function saveCurrentPreview(node, state) {
             body: JSON.stringify({
                 owner_id: findUpstreamExtenderId(node),
                 generation_mode: upstreamGenerationMode(node),
+                motion_context: upstreamMotionContext(node),
                 filename: info.filename,
                 subfolder: info.subfolder || "",
                 type: info.type || "temp",
@@ -1905,6 +2006,8 @@ function makePlayer(node) {
         syncingPlayer: false,
         lastRenderMode: null,
         legacyNodeHeight: null,
+        legacyWidthPinInstalled: false,
+        legacyWidthOwnDescriptor: null,
         liveLoaded: false,
         restoreLoaded: false,
         restoreRequestRunning: false,
@@ -1986,6 +2089,7 @@ function makePlayer(node) {
 
     const oldRemove = node.onRemoved;
     node.onRemoved = function () {
+        setLegacyPreviewWidgetFullWidth(state, false);
         try {
             video.pause();
             video.removeAttribute("src");
@@ -2005,7 +2109,7 @@ function makePlayer(node) {
     return state;
 }
 
-function refreshImportedProjectPreview(ownerId) {
+function refreshImportedProjectPreview(ownerId, generationMode = null, motionContext = null) {
     const graph = app.graph;
     if (!graph) return;
     const wanted = String(ownerId);
@@ -2017,6 +2121,10 @@ function refreshImportedProjectPreview(ownerId) {
         state.liveLoaded = false;
         state.restoreLoaded = false;
         state.restoreRequestRunning = false;
+        state.restoreModeOverride = String(generationMode || "") === "fl2va"
+            ? "fl2va"
+            : (String(generationMode || "") === "ref2va" ? "ref2va" : null);
+        state.restoreMotionOverride = motionContext == null ? null : boolValue(motionContext, true);
         state.currentVideoInfo = null;
         state.currentPreviewMeta = null;
         state.stitchMeta = null;
@@ -2040,11 +2148,40 @@ function refreshImportedProjectPreview(ownerId) {
 app.registerExtension({
     name: "MiniMaxH3.MotionContext.LivePreview",
 
+    beforeConfigureGraph() {
+        h3PreviewGraphConfiguring = true;
+    },
+
+    loadedGraphNode(node) {
+        if (!(node?.comfyClass === TARGET || node?.type === TARGET)) return;
+        stripFinalDecodeOutputs(node);
+        hideCompatibilityWidget(node, "fps");
+        makePlayer(node);
+    },
+
+    afterConfigureGraph() {
+        h3PreviewGraphConfiguring = false;
+        requestAnimationFrame(() => {
+            for (const node of app.graph?._nodes || []) {
+                if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+                stripFinalDecodeOutputs(node);
+                hideCompatibilityWidget(node, "fps");
+                const state = makePlayer(node);
+                syncPlayerToNode(node, state, true);
+                restorePreviewOnLoad(node, state);
+            }
+        });
+    },
+
     setup() {
         window.addEventListener("h3-extender-project-loaded", (event) => {
             const ownerId = event?.detail?.owner_id;
             if (ownerId == null) return;
-            refreshImportedProjectPreview(ownerId);
+            refreshImportedProjectPreview(
+                ownerId,
+                event?.detail?.generation_mode,
+                event?.detail?.motion_context,
+            );
         });
         window.addEventListener("h3-extender-color-updated", (event) => {
             const ownerId = event?.detail?.owner_id;
@@ -2108,7 +2245,7 @@ app.registerExtension({
                     hideFinalDecodeGenerationWidgets(this);
                     syncStitchSection(this, state);
                     syncPlayerToNode(this, state, true);
-                    restorePreviewOnLoad(this, state);
+                    if (!h3PreviewGraphConfiguring) restorePreviewOnLoad(this, state);
                 });
             });
 
@@ -2148,7 +2285,8 @@ app.registerExtension({
                 ensureLatentUpscaleWidgetDefaults(this);
                 hideFinalDecodeGenerationWidgets(this);
                 syncStitchSection(this, state);
-                restorePreviewOnLoad(this, state);
+                syncPlayerToNode(this, state, true);
+                if (!h3PreviewGraphConfiguring) restorePreviewOnLoad(this, state);
             });
             return r;
         };
@@ -2165,11 +2303,16 @@ app.registerExtension({
             const meta = message?.h3_preview_info?.[0];
 
             let baseLabel = "FULL LIVE PREVIEW";
-            if (meta?.mode === "clip_by_clip") {
+            if (meta?.interrupted) {
+                const shown = Number(meta?.preview_clips || meta?.clip || 0);
+                const total = Number(meta?.total_clips || shown || 0);
+                baseLabel =
+                    `INTERRUPTED PREVIEW — ${shown}/${total} clips (${meta.preview_frames} frames)`;
+            } else if (meta?.mode === "clip_by_clip") {
                 const s = Number(meta.seam_shift || 0);
                 baseLabel =
                     `FULL LIVE PREVIEW — ${meta.total_clips} clip${meta.total_clips > 1 ? "s" : ""} — shift ${s >= 0 ? "+" : ""}${s}`;
-            } else if (meta?.mode === "full_batch" || meta?.mode === "full_batch_stitch") {
+            } else if (meta?.mode === "full_batch" || meta?.mode === "full_batch_stitch" || meta?.mode === "full_batch_incremental") {
                 baseLabel = meta?.seamless_stitch
                     ? `STITCHED PREVIEW — ${meta.total_clips} clips (${meta.preview_frames} frames)`
                     : `FINAL PREVIEW — ${meta.total_clips} clips (${meta.preview_frames} frames)`;
@@ -2210,7 +2353,7 @@ app.registerExtension({
 
             state.currentVideoInfo = { ...info };
             state.currentPreviewMeta = {
-                clip_count: Number(meta?.total_clips || 0),
+                clip_count: Number(meta?.preview_clips || meta?.total_clips || 0),
                 frame_count: Number(meta?.preview_frames || 0),
                 mode: String(meta?.mode || ""),
                 active_layer: activeLayer,

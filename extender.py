@@ -20,12 +20,14 @@ import datetime as _datetime
 import hashlib
 import json
 import logging
+import mimetypes
 import math
 import os
 import re
 from pathlib import Path
 import secrets
 import shutil
+import subprocess
 import time
 import uuid
 import zipfile
@@ -59,7 +61,7 @@ from .motion_context_disk import (
     _DATA_START,
     _chain_paths,
     _clear_refine_sidecar,
-_invalidate_refine_from_index,
+    _invalidate_refine_from_index,
     _decoded_audio_cache_path,
     _decoded_audio_cache_end,
     _decoded_preview_cache_path,
@@ -75,6 +77,12 @@ _invalidate_refine_from_index,
     _manifest_for_first,
     _truncate_chain,
     _final_frame_count,
+    clear_full_batch_interrupt,
+    full_batch_interrupt_requested,
+    cache_full_batch_ref2va_segment,
+    normalize_full_batch_export_profile,
+    _find_ffmpeg,
+    _resolve_full_batch_export_profile,
 )
 from .fl2va_engine import (
     normalize_mode as _normalize_generation_mode,
@@ -93,9 +101,15 @@ from .fl2va_engine import (
     compact_fl2va_cache,
     fl2va_project_continuity_files,
     install_fl2va_project_continuity,
+    cache_full_batch_fl2va_plan,
+)
+from .ref2va_independent import (
+    cache_owner_id as _ref2va_independent_cache_owner_id,
+    run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v2.2.1-latent-refine"
+BUILD = "minimax-h3-extender-v2.7.4"
+_LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -123,21 +137,25 @@ class _LazyUnconnected:
 
 _LAZY_UNCONNECTED = _LazyUnconnected()
 MAX_REF_AUDIO_SECONDS = 15.0
+REF_AUDIO_TIMELINE_SPLIT_SECONDS = 5.0
 MAX_CLIPS = 512
+MAX_FL2VA_GUIDES = 3
 DEFAULT_DURATION = 10.0
 DEFAULT_MEGAPIXELS = 0.40
 MAX_RESOLUTION = 4096
 DEFAULT_SEED_MAX = (1 << 53) - 1  # exact integer range in browser JS
 
 PROJECT_FORMAT = "MiniMax H3 Extender Project"
-PROJECT_FORMAT_VERSION = 2
-PROJECT_SUPPORTED_VERSIONS = {1, 2}
+PROJECT_FORMAT_VERSION = 4
+PROJECT_SUPPORTED_VERSIONS = {1, 2, 3, 4}
 PROJECT_JSON_MAX_BYTES = 16 * 1024 * 1024
 PROJECT_DOWNLOAD_TTL_SECONDS = 2 * 60 * 60
 PROJECT_COPY_CHUNK = 8 * 1024 * 1024
 MAX_IMAGE_REFS = MAX_REFERENCE_SLOTS
 REFS_JSON_VERSION = 2
 MAX_REF_UPLOAD_BYTES = 256 * 1024 * 1024
+MAX_LOCAL_MEDIA_UPLOAD_BYTES = 512 * 1024 * 1024
+LOCAL_REFS_VERSION = 1
 MAX_REF_PIXELS = 120_000_000
 _PROJECT_DOWNLOADS = {}
 
@@ -216,14 +234,6 @@ def _auto_resolution_from_dimensions(src_w: int, src_h: int, megapixels: float):
     return w, h
 
 
-def _auto_resolution_from_image(image, megapixels: float):
-    if image is None or getattr(image, "ndim", 0) < 4:
-        raise ValueError("MiniMax H3 Extender: invalid reference image for auto resolution.")
-    return _auto_resolution_from_dimensions(
-        int(image.shape[2]),
-        int(image.shape[1]),
-        megapixels,
-    )
 
 
 def _refs_root():
@@ -242,6 +252,228 @@ def _ref_path(ref_id):
     if not _ref_id_is_safe(ref_id):
         raise ValueError("MiniMax H3 Extender: invalid internal reference id.")
     return _refs_root() / f"{ref_id}.png"
+
+
+def _local_media_root():
+    root = _ensure_cache_root() / "_local_media_refs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _local_media_path(media_id):
+    media_id = str(media_id or "").lower().strip()
+    if not _ref_id_is_safe(media_id):
+        raise ValueError("MiniMax H3 Extender: invalid local media reference id.")
+    return _local_media_root() / f"{media_id}.bin"
+
+
+def _normalize_media_descriptor(value, expected_kind=None):
+    if not isinstance(value, dict):
+        return None
+    media_id = str(value.get("id") or value.get("media_id") or "").lower().strip()
+    if not _ref_id_is_safe(media_id):
+        return None
+    kind = str(value.get("kind") or expected_kind or "").lower().strip()
+    if expected_kind is not None:
+        kind = str(expected_kind).lower().strip()
+    if kind not in {"video", "audio"}:
+        return None
+    try:
+        size_bytes = max(0, int(value.get("size_bytes", 0) or 0))
+    except Exception:
+        size_bytes = 0
+    try:
+        duration = max(0.0, float(value.get("duration", 0.0) or 0.0))
+    except Exception:
+        duration = 0.0
+    try:
+        width = max(0, int(value.get("width", 0) or 0))
+        height = max(0, int(value.get("height", 0) or 0))
+    except Exception:
+        width = height = 0
+    try:
+        fps = max(0.0, float(value.get("fps", 0.0) or 0.0))
+    except Exception:
+        fps = 0.0
+    return {
+        "id": media_id,
+        "kind": kind,
+        "original_name": str(value.get("original_name") or value.get("name") or f"local_ref.{kind}"),
+        "size_bytes": size_bytes,
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "has_audio": bool(value.get("has_audio", False)),
+    }
+
+
+def _normalize_local_refs(value):
+    raw = value if isinstance(value, dict) else {}
+    out = {"version": LOCAL_REFS_VERSION, "images": [], "videos": [], "audios": []}
+    seen = {"images": set(), "videos": set(), "audios": set()}
+    specs = (("images", MAX_IMAGE_REFS), ("videos", MAX_VIDEO_REFS), ("audios", MAX_STANDALONE_AUDIO_REFS))
+    for key, limit in specs:
+        source = raw.get(key) if isinstance(raw.get(key), list) else []
+        for item in source[:limit]:
+            item = item if isinstance(item, dict) else {}
+            try:
+                slot = int(item.get("slot", 0) or 0)
+            except Exception:
+                slot = 0
+            if slot < 1 or slot > limit or slot in seen[key]:
+                continue
+            if key == "images":
+                payload = _normalize_ref_descriptor(item.get("ref", item.get("image")))
+                if payload is None:
+                    continue
+                out[key].append({"slot": slot, "ref": payload})
+            else:
+                expected = "video" if key == "videos" else "audio"
+                payload = _normalize_media_descriptor(item.get("media", item), expected)
+                if payload is None:
+                    continue
+                out[key].append({"slot": slot, "media": payload})
+            seen[key].add(slot)
+    return out
+
+
+def _probe_media_file(path, kind):
+    path = Path(path)
+    ffmpeg = _find_ffmpeg()
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    text = proc.stderr.decode("utf-8", errors="replace")
+    kind = str(kind).lower().strip()
+    video_lines = [line for line in text.splitlines() if " Video: " in line]
+    audio_lines = [line for line in text.splitlines() if " Audio: " in line]
+    if kind == "video" and not video_lines:
+        raise ValueError("MiniMax H3 Extender: uploaded local video contains no readable video stream.")
+    if kind == "audio" and not audio_lines:
+        raise ValueError("MiniMax H3 Extender: uploaded local audio contains no readable audio stream.")
+
+    duration = 0.0
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if match:
+        duration = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+    width = height = 0
+    fps = 0.0
+    if video_lines:
+        vline = video_lines[0]
+        dims = re.search(r"(?<!\d)(\d{2,5})x(\d{2,5})(?!\d)", vline)
+        if dims:
+            width, height = int(dims.group(1)), int(dims.group(2))
+        fps_match = re.search(r"(\d+(?:\.\d+)?)\s+fps", vline)
+        if fps_match:
+            fps = float(fps_match.group(1))
+    return {
+        "duration": max(0.0, float(duration)),
+        "width": max(0, int(width)),
+        "height": max(0, int(height)),
+        "fps": max(0.0, float(fps)),
+        "has_audio": bool(audio_lines),
+    }
+
+
+def _store_uploaded_media(source_path, original_name, kind):
+    source_path = Path(source_path)
+    kind = str(kind).lower().strip()
+    if kind not in {"video", "audio"}:
+        raise ValueError("MiniMax H3 Extender: local media kind must be video or audio.")
+    meta = _probe_media_file(source_path, kind)
+    if float(meta.get("duration", 0.0) or 0.0) > 0.0 and float(meta["duration"]) + 1e-6 < MIN_REF_AUDIO_SECONDS:
+        raise ValueError(
+            f"MiniMax H3 Extender: local {kind} reference is only {float(meta['duration']):.3f}s; "
+            f"MiniMax H3 references require at least {MIN_REF_AUDIO_SECONDS:.0f}s."
+        )
+    media_id = _hash_file(source_path)
+    target = _local_media_path(media_id)
+    if not target.exists():
+        temp = _local_media_root() / f".upload_{uuid.uuid4().hex}.bin"
+        shutil.copyfile(source_path, temp)
+        try:
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
+    return {
+        "id": media_id,
+        "kind": kind,
+        "original_name": str(original_name or f"local_ref.{kind}"),
+        "size_bytes": int(target.stat().st_size),
+        **meta,
+    }
+
+
+def _load_local_audio_media(desc, cache=None):
+    desc = _normalize_media_descriptor(desc, "audio")
+    if desc is None:
+        raise ValueError("MiniMax H3 Extender: invalid local audio metadata.")
+    cache = cache if isinstance(cache, dict) else {}
+    key = ("audio", desc["id"])
+    if key in cache:
+        return cache[key]
+    path = _local_media_path(desc["id"] )
+    if not path.exists():
+        raise FileNotFoundError(f"MiniMax H3 Extender: local audio '{desc['original_name']}' is missing.")
+    ffmpeg = _find_ffmpeg()
+    cmd = [
+        ffmpeg, "-v", "error", "-i", str(path), "-vn", "-t", str(MAX_REF_AUDIO_SECONDS),
+        "-ac", "2", "-ar", "48000", "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode("utf-8", errors="replace")[-2000:]
+        raise RuntimeError(f"MiniMax H3 Extender: failed to decode local audio '{desc['original_name']}'. {detail}")
+    arr = np.frombuffer(proc.stdout, dtype=np.float32)
+    if arr.size < 2:
+        raise ValueError(f"MiniMax H3 Extender: local audio '{desc['original_name']}' decoded empty.")
+    arr = arr[: (arr.size // 2) * 2].reshape(-1, 2).T.copy()
+    audio = {"waveform": torch.from_numpy(arr).unsqueeze(0), "sample_rate": 48000}
+    cache[key] = audio
+    return audio
+
+
+def _load_local_video_media(desc, frame_count, cache=None):
+    desc = _normalize_media_descriptor(desc, "video")
+    if desc is None:
+        raise ValueError("MiniMax H3 Extender: invalid local video metadata.")
+    cache = cache if isinstance(cache, dict) else {}
+    wanted = max(5, min(int(frame_count or MAX_REF_VIDEO_FRAMES), MAX_REF_VIDEO_FRAMES))
+    key = ("video", desc["id"], wanted)
+    if key in cache:
+        return cache[key]
+    path = _local_media_path(desc["id"] )
+    if not path.exists():
+        raise FileNotFoundError(f"MiniMax H3 Extender: local video '{desc['original_name']}' is missing.")
+    width = int(desc.get("width", 0) or 0)
+    height = int(desc.get("height", 0) or 0)
+    if width <= 0 or height <= 0:
+        meta = _probe_media_file(path, "video")
+        width, height = int(meta["width"]), int(meta["height"])
+    if width <= 0 or height <= 0:
+        raise ValueError(f"MiniMax H3 Extender: could not determine dimensions for local video '{desc['original_name']}'.")
+    target_w, target_h = _adapt_ref_video_canvas(width, height)
+    ffmpeg = _find_ffmpeg()
+    vf = f"fps={FPS},scale={target_w}:{target_h}:flags=lanczos"
+    cmd = [
+        ffmpeg, "-v", "error", "-i", str(path), "-an", "-vf", vf,
+        "-frames:v", str(wanted), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode("utf-8", errors="replace")[-2000:]
+        raise RuntimeError(f"MiniMax H3 Extender: failed to decode local video '{desc['original_name']}'. {detail}")
+    frame_bytes = int(target_w) * int(target_h) * 3
+    count = len(proc.stdout) // frame_bytes
+    if count <= 0:
+        raise ValueError(f"MiniMax H3 Extender: local video '{desc['original_name']}' decoded no frames.")
+    raw = np.frombuffer(proc.stdout[:count * frame_bytes], dtype=np.uint8).reshape(count, target_h, target_w, 3).copy()
+    video = torch.from_numpy(raw)
+    cache[key] = video
+    return video
 
 
 def _empty_refs():
@@ -524,21 +756,50 @@ def _normalize_external_ref_pack(value):
     }
 
 
-def _sync_refs_from_ref_pack(refs, pack):
+def _local_picture_slot_reservations(clips):
+    """Return global Picture slot numbers reserved by at least one clip-local ref."""
+    reserved = set()
+    for cfg in clips or []:
+        local = _normalize_local_refs((cfg or {}).get("local_refs"))
+        for item in local.get("images", []):
+            try:
+                slot = int(item.get("slot", 0) or 0)
+            except Exception:
+                slot = 0
+            if 1 <= slot <= MAX_IMAGE_REFS:
+                reserved.add(slot)
+    return reserved
+
+
+def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
     """Inject connected external slots into the existing internal Ref N slots.
 
     Empty external slots are deliberately no-ops: they never clear or compact an
-    internal reference.  Connected slots keep their exact logical number.
+    internal reference. Connected slots keep their exact logical number.
+
+    A slot already reserved by any clip-local Picture is skipped, not remapped and
+    never treated as a fatal error. Local refs deliberately win so an external
+    Reference Pack cannot block an otherwise valid render.
     """
     refs = _normalize_ref_descriptors(refs)
     if pack is None:
-        return refs, []
+        return refs, [], []
 
+    reserved_slots = {int(x) for x in (reserved_slots or set()) if 1 <= int(x) <= MAX_IMAGE_REFS}
     imported_slots = []
+    skipped_slots = []
     for index, image in enumerate(pack.get("slots") or [], start=1):
         if index > MAX_IMAGE_REFS:
             break
         if image is None:
+            continue
+        if index in reserved_slots:
+            skipped_slots.append(index)
+            _LOG.warning(
+                "H3 Extender: Reference Pack Ref %d ignored because Picture %d is reserved by a local clip reference.",
+                index,
+                index,
+            )
             continue
         try:
             descriptor, changed = _store_external_reference(
@@ -554,7 +815,7 @@ def _sync_refs_from_ref_pack(refs, pack):
         if changed:
             imported_slots.append(index)
 
-    return refs, imported_slots
+    return refs, imported_slots, skipped_slots
 
 
 def _edit_internal_reference(source_id, original_name, brightness, contrast, saturation, external_signature=""):
@@ -796,6 +1057,8 @@ def _resolution_from_manifest(manifest):
 
 def _resize(image, width: int, height: int):
     samples = image[..., :3].movedim(-1, 1)
+    if samples.dtype == torch.uint8:
+        samples = samples.float().div_(255.0)
     samples = comfy.utils.common_upscale(
         samples, int(width), int(height), "lanczos", "disabled"
     )
@@ -837,28 +1100,77 @@ def _normalize_ref_video_fps(value, label: str):
     return fps
 
 
-def _resample_ref_video_to_h3_fps(video_frames, source_fps: float, label: str):
-    """Resample a reference-video IMAGE batch to H3's fixed 24 fps.
-
-    IMAGE batches do not carry timestamps/FPS metadata. The Extender therefore
-    accepts an explicit source FPS and resamples the batch so H3 sees the same
-    source duration at its required 24-fps cadence.
-    """
+def _ref_video_h3_frame_count(video_frames, source_fps: float, label: str):
+    """Return the H3 24-fps frame count without materializing a resampled batch."""
     fps = _normalize_ref_video_fps(source_fps, label)
     if not torch.is_tensor(video_frames) or video_frames.ndim != 4:
         raise ValueError(f"MiniMax H3 Extender: {label} must be an IMAGE batch [frames,H,W,C].")
-    if abs(fps - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
-        return video_frames
-
     source_count = int(video_frames.shape[0])
+    if abs(fps - float(FPS)) < 1e-6 or source_count <= 1:
+        return fps, source_count
     duration = source_count / fps
-    target_count = max(1, int(round(duration * float(FPS))))
-    idx = torch.round(
-        torch.arange(target_count, device=video_frames.device, dtype=torch.float32) * (fps / float(FPS))
-    ).to(torch.long)
-    idx = torch.clamp(idx, 0, source_count - 1)
+    return fps, max(1, int(round(duration * float(FPS))))
+
+
+def _take_ref_video_h3_frames(video_frames, source_fps: float, start: int, end: int):
+    """Materialize only the requested H3-frame window from a source video."""
+    start = max(0, int(start))
+    end = max(start, int(end))
+    if end <= start:
+        return video_frames[:0]
+    if abs(float(source_fps) - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
+        return video_frames[start:end]
+
+    positions = torch.arange(
+        start, end, device=video_frames.device, dtype=torch.float32
+    )
+    idx = torch.round(positions * (float(source_fps) / float(FPS))).to(torch.long)
+    idx = torch.clamp(idx, 0, int(video_frames.shape[0]) - 1)
     return video_frames.index_select(0, idx)
 
+
+def _resize_ref_video_h3_frames(
+    video_frames, source_fps: float, count: int, width: int, height: int, chunk_frames: int = 32
+):
+    """Resize a bounded H3 prefix without a full 24-fps intermediate tensor."""
+    count = max(0, int(count))
+    if count <= 0:
+        return video_frames[:0, :int(height), :int(width), :3]
+    chunk_frames = max(1, int(chunk_frames))
+    out = torch.empty(
+        (count, int(height), int(width), 3),
+        device=video_frames.device,
+        dtype=(torch.float32 if video_frames.dtype == torch.uint8 else video_frames.dtype),
+    )
+    for start in range(0, count, chunk_frames):
+        end = min(count, start + chunk_frames)
+        source_chunk = _take_ref_video_h3_frames(video_frames, source_fps, start, end)
+        resized_chunk = _resize(source_chunk, width, height)
+        out[start:end].copy_(resized_chunk)
+        del source_chunk, resized_chunk
+    return out
+
+
+def _resize_ref_video_qwen_frames(
+    video_frames, source_fps: float, count: int, width: int, height: int
+):
+    """Resize only the half-second Qwen samples for a cached video latent."""
+    sample_step = max(1, FPS // 2)
+    target_positions = list(range(0, int(count), sample_step))
+    if not target_positions:
+        return video_frames[:0, :int(height), :int(width), :3], target_positions
+
+    if abs(float(source_fps) - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
+        selected = video_frames[target_positions]
+    else:
+        positions = torch.tensor(
+            target_positions, device=video_frames.device, dtype=torch.float32
+        )
+        idx = torch.round(positions * (float(source_fps) / float(FPS))).to(torch.long)
+        idx = torch.clamp(idx, 0, int(video_frames.shape[0]) - 1)
+        selected = video_frames.index_select(0, idx)
+    resized = _resize(selected, width, height)
+    return resized, target_positions
 
 def _audio_duration_seconds(audio):
     if not isinstance(audio, dict) or "waveform" not in audio:
@@ -875,9 +1187,9 @@ def _audio_duration_seconds(audio):
 def _slice_ref_audio(audio, start_seconds: float, duration_seconds: float, label: str, require_full: bool):
     """Return an AUDIO payload cropped before Audio-VAE encoding.
 
-    Long standalone references use require_full=True so every clip gets exactly
-    its own sequential timeline window. Video soundtracks use require_full=False
-    because container audio can be a few samples shorter than the video stream.
+    require_full=True is available for callers that need exact source coverage.
+    Standalone timeline refs and video soundtracks use require_full=False so a
+    source may end naturally inside the requested window.
     """
     if not isinstance(audio, dict) or "waveform" not in audio:
         raise ValueError(f"MiniMax H3 Extender: {label} is not a valid AUDIO payload.")
@@ -938,11 +1250,10 @@ def _prepare_standalone_audio_refs(
 ):
     """Build per-clip standalone audio refs without reusing illegal long audio.
 
-    Native-sized refs (<=15s) remain reusable references: they start at 0 for
-    every clip and are cropped to the current clip duration when useful. A long
-    source (>15s) is treated as a timeline and automatically advanced by the
-    cumulative H3-aligned duration of preceding cards that selected the same
-    logical Audio slot.
+    Reusable refs start at 0 for every clip. A source is treated as a timeline
+    only when it is longer than both the 5s split threshold and the current
+    H3-aligned clip duration; timeline refs advance by the cumulative duration
+    of preceding cards that selected the same logical Audio slot.
     """
     active = [
         (slot, audio)
@@ -950,7 +1261,7 @@ def _prepare_standalone_audio_refs(
         if audio is not None
     ]
     if not active:
-        return [], []
+        return [], [], []
     if audio_vae is None:
         raise ValueError(
             "MiniMax H3 Extender: standalone audio reference inputs are connected but audio_vae is not. "
@@ -969,17 +1280,34 @@ def _prepare_standalone_audio_refs(
     for slot, audio in active:
         label = f"ref_audio_{slot}"
         source_duration = _audio_duration_seconds(audio)
-        timeline_mode = source_duration > MAX_REF_AUDIO_SECONDS + 1e-6
+        timeline_mode = source_duration > max(
+            REF_AUDIO_TIMELINE_SPLIT_SECONDS,
+            clip_duration_seconds,
+        ) + 1e-6
 
         if timeline_mode:
+            # A true timeline must fit inside H3's per-reference 15s limit for
+            # each card. Silently consuming only the first 15s while advancing
+            # by a longer card duration would skip source audio between clips.
             if clip_duration_seconds > MAX_REF_AUDIO_SECONDS + 1e-6:
                 raise ValueError(
                     f"MiniMax H3 Extender: {label} cannot cover this clip as one H3 audio reference: "
                     f"effective clip duration is {clip_duration_seconds:.3f}s, above the {MAX_REF_AUDIO_SECONDS:.0f}s reference-audio limit."
                 )
             start = float(clip_start_offsets.get(slot, 0.0)) if clip_start_offsets is not None else default_clip_start
-            duration = clip_duration_seconds
-            sliced = _slice_ref_audio(audio, start, duration, label, require_full=True)
+            remaining = max(0.0, source_duration - start)
+
+            # A timeline ref is allowed to end inside the current clip. Use the
+            # available tail instead of requiring the source to cover the whole
+            # generated clip. Once less than H3's minimum usable reference-audio
+            # duration remains, this logical Audio slot is simply absent for the
+            # current/subsequent clips; the timeline is never looped or restarted.
+            # Keep a small margin for sample-index rounding in _slice_ref_audio.
+            if remaining < MIN_REF_AUDIO_SECONDS + 1e-3:
+                continue
+
+            duration = min(clip_duration_seconds, remaining, MAX_REF_AUDIO_SECONDS)
+            sliced = _slice_ref_audio(audio, start, duration, label, require_full=False)
         else:
             # Preserve classic short-reference behavior across every clip, but
             # never feed more audio than the current generated clip requires.
@@ -1033,7 +1361,7 @@ def _prepare_standalone_audio_refs(
                 "audio_latent": audio_latent,
             }
         )
-    return ref_items, ref_blocks
+    return ref_items, ref_blocks, [int(slot) for slot, *_ in prepared]
 
 
 _AUDIO_TAG_RE = re.compile(r"<Audio\s+(\d+)>", re.IGNORECASE)
@@ -1220,44 +1548,30 @@ def _prepare_shared_refs(
     target_frames = max(5, min(target_frames, MAX_REF_VIDEO_FRAMES))
     total_ref_video_frames = 0
     for video_index, (slot, video_frames, source_fps, soundtrack) in enumerate(active_videos):
-        frames_24 = _resample_ref_video_to_h3_fps(video_frames, source_fps, f"ref_video_{slot}")
-        min_ref_frames = int(2 * FPS)
-        n24 = int(frames_24.shape[0])
-        if n24 < 1:
+        source_fps, full_h3_frames = _ref_video_h3_frame_count(
+            video_frames, source_fps, f"ref_video_{slot}"
+        )
+        if int(full_h3_frames) < int(2 * FPS):
             raise ValueError(
-                f"MiniMax H3 Extender: ref_video_{slot} has no frames after 24 fps resample."
-            )
-        if n24 < min_ref_frames:
-            # Prefer completing the run over rejecting short refs. Repeat the last
-            # frame so H3 still sees a 2s @ 24 fps reference timeline.
-            pad = min_ref_frames - n24
-            frames_24 = torch.cat([frames_24, frames_24[-1:].repeat(pad, 1, 1, 1)], dim=0)
-            logging.warning(
-                "MiniMax H3 Extender: ref_video_%s is %.2fs at 24 fps (< 2.00s); "
-                "padded %d frame(s) by repeating the last frame.",
-                slot,
-                float(n24) / float(FPS),
-                int(pad),
+                f"MiniMax H3 Extender: ref_video_{slot} is shorter than MiniMax H3's 2-second minimum at 24 fps."
             )
 
-        vh, vw = int(frames_24.shape[1]), int(frames_24.shape[2])
+        vh, vw = int(video_frames.shape[1]), int(video_frames.shape[2])
         cw, ch = _adapt_ref_video_canvas(vw, vh)
         if vw * vh < cw * ch:
             cw = max(CANVAS_MULTIPLE, round(vw / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
             ch = max(CANVAS_MULTIPLE, round(vh / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
 
-        frames = _resize(frames_24, cw, ch)
-        if int(frames.shape[0]) > target_frames:
-            frames = frames[:target_frames]
-
-        n = int(frames.shape[0])
+        # Crop to the requested clip duration and H3 17k+5 grid BEFORE any
+        # expensive Lanczos resize. This preserves the exact former prefix but
+        # never processes frames that will be discarded afterwards.
+        n = min(int(full_h3_frames), int(target_frames))
         while n >= 5 and n % 17 != 5:
             n -= 1
         if n < 5:
             raise ValueError(
                 f"MiniMax H3 Extender: ref_video_{slot} cannot be aligned to the H3 17k+5 frame grid."
             )
-        frames = frames[:n]
         total_ref_video_frames += n
         if total_ref_video_frames > MAX_REF_VIDEO_FRAMES:
             raise ValueError(
@@ -1269,14 +1583,30 @@ def _prepare_shared_refs(
             if cached_video_blocks is not None and video_index < len(cached_video_blocks)
             else None
         )
-        if (
+        latent_cached = (
             isinstance(cached_block, dict)
             and str(cached_block.get("kind") or "").startswith("video")
             and cached_block.get("latent") is not None
-        ):
+        )
+        if latent_cached:
             z = cached_block.get("latent")
+            # A cached VAE latent only needs the sparse Qwen presentation frames.
+            # Resize those samples directly instead of rebuilding all n RGB frames.
+            qwen_frames, sample_idx = _resize_ref_video_qwen_frames(
+                video_frames, source_fps, n, cw, ch
+            )
         else:
+            # VAE encoding needs the complete aligned RGB sequence. Build it in
+            # bounded chunks directly from the source cadence, avoiding a second
+            # full-size 24-fps intermediate batch.
+            frames = _resize_ref_video_h3_frames(
+                video_frames, source_fps, n, cw, ch, chunk_frames=32
+            )
             z = vae.encode(frames)
+            sample_step = max(1, FPS // 2)
+            sample_idx = list(range(0, n, sample_step))
+            qwen_frames = frames[sample_idx]
+            del frames
 
         audio_latent = None
         ref_audio_t = 0
@@ -1308,9 +1638,6 @@ def _prepare_shared_refs(
             # The soundtrack gets its own <Audio j> label immediately before its video.
             ref_items.append({"type": "audio"})
 
-        sample_step = max(1, FPS // 2)
-        sample_idx = list(range(0, int(frames.shape[0]), sample_step))
-        qwen_frames = frames[sample_idx]
         ref_items.append(
             {
                 "type": "video",
@@ -1697,13 +2024,41 @@ def _default_clip(index: int = 0):
         "refine_validated": False,
         "color_adjustment": _normalize_color_adjustment(),
         "loras": [],
+        "local_refs": _normalize_local_refs(None),
         "first_frame": None,
         "last_frame": None,
+        "guides": [],
         "first_source": "manual",
     }
 
 
-def _parse_clips_json(value: str, generation_mode="ref2va"):
+
+def _normalize_fl2va_guides(raw_guides, legacy_frame=None, legacy_idx=0):
+    guides = []
+    source = raw_guides if isinstance(raw_guides, list) else None
+    if source is None:
+        legacy = _normalize_ref_descriptor(legacy_frame)
+        if legacy is not None:
+            source = [{"frame": legacy, "frame_idx": legacy_idx}]
+        else:
+            source = []
+
+    for raw in source[:MAX_FL2VA_GUIDES]:
+        raw = raw if isinstance(raw, dict) else {}
+        frame = _normalize_ref_descriptor(raw.get("frame", raw.get("guide_frame")))
+        if frame is None:
+            continue
+        try:
+            frame_idx = int(raw.get("frame_idx", raw.get("guide_frame_idx", 0)) or 0)
+        except Exception:
+            frame_idx = 0
+        guides.append({
+            "frame": frame,
+            "frame_idx": max(-9999, min(9999, frame_idx)),
+        })
+    return guides
+
+def _parse_clips_json(value: str, generation_mode="ref2va", motion_context=True):
     try:
         payload = json.loads(value or "{}")
     except Exception as exc:
@@ -1754,8 +2109,14 @@ def _parse_clips_json(value: str, generation_mode="ref2va"):
                 "refine_validated": bool(raw.get("refine_validated", False)),
                 "color_adjustment": _normalize_color_adjustment(raw.get("color_adjustment")),
                 "loras": _normalize_clip_loras(raw.get("loras"), legacy=raw.get("lora")),
+                "local_refs": _normalize_local_refs(raw.get("local_refs")),
                 "first_frame": _normalize_ref_descriptor(raw.get("first_frame")),
                 "last_frame": _normalize_ref_descriptor(raw.get("last_frame")),
+                "guides": _normalize_fl2va_guides(
+                    raw.get("guides"),
+                    legacy_frame=raw.get("guide_frame"),
+                    legacy_idx=raw.get("guide_frame_idx", 0),
+                ),
                 "first_source": (
                     "previous_clip"
                     if str(raw.get("first_source") or "manual").lower().strip() == "previous_clip" and i > 0
@@ -1767,7 +2128,7 @@ def _parse_clips_json(value: str, generation_mode="ref2va"):
     # Ref2VA + Motion Context is causal, so validation must remain a continuous
     # prefix. FL2VA plans are independent and deliberately keep per-card
     # validation without forcing downstream cards open.
-    if _normalize_generation_mode(generation_mode) == "ref2va":
+    if _normalize_generation_mode(generation_mode) == "ref2va" and bool(motion_context):
         found_open = False
         for clip in out:
             if found_open:
@@ -1800,10 +2161,12 @@ def _prompt_pack_signature_from_state(value):
     return signature
 
 
-def _state_json(clips, prompt_pack_signature="", generation_mode=None):
+def _state_json(clips, prompt_pack_signature="", generation_mode=None, motion_context=None):
     payload = {"version": 1, "clips": clips}
     if generation_mode is not None:
         payload["generation_mode"] = _normalize_generation_mode(generation_mode)
+    if motion_context is not None:
+        payload["motion_context"] = bool(motion_context)
     signature = str(prompt_pack_signature or "").lower().strip()
     if len(signature) == 64 and all(ch in "0123456789abcdef" for ch in signature):
         payload["prompt_pack_signature"] = signature
@@ -1880,6 +2243,168 @@ def _manifest_for_extender(owner_id, fps=24.0):
     return _manifest_for_first(f"extender_{owner_id}", fps)
 
 
+def _literal_prompt_value(value, default):
+    # Connected inputs are represented as [node_id, output_index]. Export
+    # profile widgets are normally literals; fall back safely if someone wires
+    # an external primitive into one of them.
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return default
+    return default if value is None else value
+
+
+def _final_decode_profile_from_prompt(prompt, extender_node_id):
+    """Read the connected Final Decode video profile before Full Batch starts.
+
+    ComfyUI executes the Extender upstream of Final Decode, so these settings
+    are not normal inputs of the Extender. The hidden PROMPT graph contains the
+    already-queued downstream node and lets us pin its literal codec/CRF/preset
+    before the first decoded clip is encoded.
+    """
+    defaults = normalize_full_batch_export_profile()
+    graph = prompt if isinstance(prompt, dict) else {}
+    candidates = []
+    direct = []
+    owner = str(extender_node_id)
+    for node_id, node in graph.items():
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("class_type") or "") != "MiniMaxH3MotionContextDiskFinalDecode":
+            continue
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+        candidates.append(inputs)
+        cache_link = inputs.get("cache")
+        if (
+            isinstance(cache_link, (list, tuple))
+            and len(cache_link) >= 1
+            and str(cache_link[0]) == owner
+        ):
+            direct.append(inputs)
+
+    source = direct[0] if direct else (candidates[0] if len(candidates) == 1 else None)
+    if source is None:
+        return defaults
+    return normalize_full_batch_export_profile({
+        "codec": _literal_prompt_value(source.get("codec"), defaults["codec"]),
+        "crf": _literal_prompt_value(source.get("crf"), defaults["crf"]),
+        "preset": _literal_prompt_value(source.get("preset"), defaults["preset"]),
+    })
+
+
+def _pin_full_batch_export_profile(manifest_path, manifest, run_mode, requested_profile):
+    """Resolve the video profile that the upcoming Full Batch should use.
+
+    - fresh Full Batch: adopt the currently queued Final Decode codec/CRF/preset;
+    - resumed/interrupted Full Batch: keep the profile already pinned in the
+      checkpoint so the remaining clips stay consistent with the cached prefix.
+    """
+    if str(run_mode) != "full_batch":
+        return manifest, None
+    requested = normalize_full_batch_export_profile(requested_profile)
+    return _resolve_full_batch_export_profile(
+        manifest_path, manifest, requested, context="H3 Extender"
+    )
+
+
+def _batch_checkpoint_active(manifest):
+    manifest = manifest if isinstance(manifest, dict) else {}
+    return bool(manifest.get("batch_in_progress", False) or manifest.get("batch_interrupted", False))
+
+
+def _begin_batch_checkpoint(manifest_path, manifest, run_mode):
+    """Start one Full-Batch transaction and report whether it is resumable.
+
+    A successful normal Full Batch clears this transient state before returning.
+    A cooperative stop, ComfyUI Kill, Python exception or process crash leaves the
+    already-written ``computed`` segment markers on disk, allowing the next Full
+    Batch execution to walk them without sampling again.
+    """
+    manifest = dict(manifest or {})
+    resume = bool(str(run_mode) == "full_batch" and _batch_checkpoint_active(manifest))
+    segments = [dict(x) for x in manifest.get("segments", [])]
+
+    if str(run_mode) == "full_batch":
+        manifest["batch_in_progress"] = True
+        manifest["batch_interrupted"] = False
+        manifest.pop("batch_snapshot_count", None)
+        manifest.pop("batch_total_clips", None)
+        manifest["batch_started_at"] = time.time()
+    else:
+        # Switching to Clip-by-Clip deliberately leaves the historical execution
+        # model. Any stale Full-Batch checkpoint markers must not alter its normal
+        # candidate/reroll semantics.
+        changed = False
+        for desc in segments:
+            if "computed" in desc:
+                desc.pop("computed", None)
+                changed = True
+        manifest["segments"] = segments
+        for key in (
+            "batch_in_progress",
+            "batch_interrupted",
+            "batch_snapshot_count",
+            "batch_total_clips",
+            "batch_started_at",
+        ):
+            if key in manifest:
+                manifest.pop(key, None)
+                changed = True
+        if not changed:
+            return manifest, False
+
+    manifest["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, manifest)
+    return manifest, resume
+
+
+def _finish_batch_checkpoint(manifest_path, manifest):
+    """Clear resumable markers after a complete, non-interrupted Full Batch."""
+    manifest = dict(manifest or {})
+    segments = [dict(x) for x in manifest.get("segments", [])]
+    for desc in segments:
+        desc.pop("computed", None)
+    manifest["segments"] = segments
+    for key in (
+        "batch_in_progress",
+        "batch_interrupted",
+        "batch_snapshot_count",
+        "batch_total_clips",
+        "batch_started_at",
+    ):
+        manifest.pop(key, None)
+    manifest["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, manifest)
+    return manifest
+
+
+def _interrupt_batch_checkpoint(manifest_path, manifest, snapshot_count, total_clips):
+    """Commit the current Full-Batch prefix as a resumable user checkpoint."""
+    manifest = dict(manifest or {})
+    manifest["batch_in_progress"] = False
+    manifest["batch_interrupted"] = True
+    manifest["batch_snapshot_count"] = max(0, int(snapshot_count))
+    manifest["batch_total_clips"] = max(0, int(total_clips))
+    manifest["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, manifest)
+    return manifest
+
+
+def _ref2va_computed_indices(manifest):
+    return [
+        i for i, desc in enumerate((manifest or {}).get("segments", []))
+        if bool(desc.get("computed", False)) and not bool(desc.get("validated", False))
+    ]
+
+
+def _fl2va_computed_ids(manifest):
+    return [
+        str(desc.get("clip_id")) for desc in (manifest or {}).get("segments", [])
+        if str(desc.get("clip_id") or "")
+        and bool(desc.get("computed", False))
+        and not bool(desc.get("validated", False))
+    ]
+
+
+
 EXTENDER_PROGRESS_EVENT = "h3_extender_progress"
 EXTENDER_PROMPT_PACK_EVENT = "h3_extender_prompt_pack_import"
 EXTENDER_REF_PACK_EVENT = "h3_extender_ref_pack_import"
@@ -1905,7 +2430,7 @@ def _send_extender_prompt_pack_import(node_id, clips_json, prompt_count, source=
         pass
 
 
-def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count, source=""):
+def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count, source="", skipped_slots=None):
     try:
         server = PromptServer.instance
         if server is None:
@@ -1916,6 +2441,7 @@ def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count
                 "node": str(node_id),
                 "refs_json": str(refs_json),
                 "imported_slots": [int(i) for i in imported_slots or []],
+                "skipped_slots": [int(i) for i in skipped_slots or []],
                 "ref_count": int(ref_count),
                 "source": str(source or "External reference pack"),
             },
@@ -2010,6 +2536,51 @@ def _generation_mode_from_project_payload(project_payload):
     return _normalize_generation_mode(value or "ref2va")
 
 
+def _motion_context_from_project_payload(project_payload):
+    """Return the saved Ref2VA Motion Context toggle (True for old projects)."""
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    if not isinstance(extender, dict):
+        return True
+    value = extender.get("motion_context")
+    if value is None:
+        settings = extender.get("settings", {})
+        if isinstance(settings, dict):
+            value = settings.get("motion_context")
+    return True if value is None else bool(value)
+
+
+def _project_cache_owner_id(owner_id, generation_mode="ref2va", motion_context=True):
+    mode = _normalize_generation_mode(generation_mode)
+    if mode == "fl2va":
+        return _fl2va_cache_owner_id(owner_id)
+    if not bool(motion_context):
+        return _ref2va_independent_cache_owner_id(owner_id)
+    return f"extender_{_safe_name(owner_id)}"
+
+
+def _causal_lineage_from_project_payload(project_payload):
+    """Read the last known causal Ref2VA clip-id order from clips_json.
+
+    v2.7 stores this frontend-only lineage so a v2.6.x positional cache can be
+    made safe after the user temporarily switches to independent Ref2VA and
+    inserts/deletes cards before ever executing Motion Context again.
+    """
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    raw = extender.get("clips_json") if isinstance(extender, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    lineage = payload.get("causal_lineage")
+    if not isinstance(lineage, list):
+        return []
+    return [str(value) for value in lineage if str(value)]
+
+
 def _prompt_pack_signature_from_project_payload(project_payload):
     extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
     raw = extender.get("clips_json")
@@ -2032,20 +2603,23 @@ def _clips_from_project_payload(project_payload):
             raw = json.dumps({"version": 1, "clips": clips}, ensure_ascii=False)
     if not isinstance(raw, str) or not raw.strip():
         raw = _state_json([_default_clip(0)])
-    return _parse_clips_json(raw, generation_mode)
+    return _parse_clips_json(raw, generation_mode, _motion_context_from_project_payload(project_payload))
 
 
 def _write_clips_to_project_payload(project_payload, clips, generation_mode=None):
     mode = _normalize_generation_mode(generation_mode or _generation_mode_from_project_payload(project_payload))
+    motion_context = _motion_context_from_project_payload(project_payload)
     signature = _prompt_pack_signature_from_project_payload(project_payload)
-    raw = _state_json(clips, signature, mode)
+    raw = _state_json(clips, signature, mode, motion_context=motion_context)
     extender = project_payload.setdefault("extender", {})
     extender["generation_mode"] = mode
+    extender["motion_context"] = bool(motion_context)
     extender["clips_json"] = raw
     extender["clips"] = copy.deepcopy(clips)
     settings = extender.setdefault("settings", {})
     if isinstance(settings, dict):
         settings["generation_mode"] = mode
+        settings["motion_context"] = bool(motion_context)
         settings["clips_json"] = raw
     return raw
 
@@ -2060,7 +2634,32 @@ def _fl2va_frame_entries(project_payload):
             ref = cfg.get(f"{kind}_frame")
             if isinstance(ref, dict) and _ref_id_is_safe(ref.get("id")):
                 entries.append((index, kind, ref))
+        for guide_index, guide in enumerate(cfg.get("guides") or [], start=1):
+            ref = guide.get("frame") if isinstance(guide, dict) else None
+            if isinstance(ref, dict) and _ref_id_is_safe(ref.get("id")):
+                entries.append((index, f"guide_{guide_index}", ref))
     return entries
+
+
+def _local_ref_assets_from_clips(clips):
+    image_refs = {}
+    media_refs = {}
+    for cfg in clips or []:
+        local = _normalize_local_refs(cfg.get("local_refs"))
+        for item in local.get("images", []):
+            ref = item.get("ref") if isinstance(item, dict) else None
+            if not isinstance(ref, dict):
+                continue
+            for ref_id in (ref.get("id"), ref.get("source_id")):
+                if _ref_id_is_safe(ref_id):
+                    image_refs[str(ref_id)] = ref
+        for key in ("videos", "audios"):
+            for item in local.get(key, []):
+                media = item.get("media") if isinstance(item, dict) else None
+                media = _normalize_media_descriptor(media, "video" if key == "videos" else "audio")
+                if media is not None:
+                    media_refs[media["id"]] = media
+    return image_refs, media_refs
 
 
 def _project_cache_snapshot(owner_id, project_payload):
@@ -2072,11 +2671,9 @@ def _project_cache_snapshot(owner_id, project_payload):
     intentionally excluded from the project.
     """
     generation_mode = _generation_mode_from_project_payload(project_payload)
-    cache_owner = (
-        _fl2va_cache_owner_id(owner_id)
-        if generation_mode == "fl2va"
-        else f"extender_{_safe_name(owner_id)}"
-    )
+    motion_context = _motion_context_from_project_payload(project_payload)
+    random_access = generation_mode == "fl2va" or (generation_mode == "ref2va" and not motion_context)
+    cache_owner = _project_cache_owner_id(owner_id, generation_mode, motion_context)
     data_path, manifest_path = _chain_paths(cache_owner)
     if not data_path.exists() or not manifest_path.exists():
         return None
@@ -2093,7 +2690,7 @@ def _project_cache_snapshot(owner_id, project_payload):
         clips = _clips_from_project_payload(project_payload)
     except Exception:
         clips = []
-    if generation_mode == "fl2va":
+    if random_access:
         order_by_id = {str(c.get("id")): i for i, c in enumerate(clips)}
         valid_by_id = {str(c.get("id")): bool(c.get("validated", False)) for c in clips}
         segments = [
@@ -2107,6 +2704,26 @@ def _project_cache_snapshot(owner_id, project_payload):
             desc["validated"] = bool(valid_by_id.get(str(desc.get("clip_id") or ""), False))
         manifest["final_frame_count"] = _final_frame_count(segments)
     else:
+        # Classic Ref2VA is positional/causal. If the card order was edited while
+        # independent Ref2VA was active, only the unchanged clip-id prefix can be
+        # safely packaged from the old causal cache. Older manifests without this
+        # metadata fall back to the frontend causal lineage stored in clips_json.
+        lineage = [str(x) for x in list(manifest.get("extender_clip_ids") or []) if str(x)]
+        if not lineage:
+            # Migration fallback for a causal cache created by v2.6.x: the
+            # frontend keeps the pre-edit causal order in clips_json even while
+            # independent Ref2VA is active. Use it when the old manifest cannot
+            # identify its positional segments itself.
+            lineage = _causal_lineage_from_project_payload(project_payload)
+        if lineage:
+            current_ids = [str(c.get("id") or "") for c in clips]
+            common = 0
+            while common < len(lineage) and common < len(current_ids) and lineage[common] == current_ids[common]:
+                common += 1
+            safe_count = min(common, len(segments))
+            segments = segments[:safe_count]
+            manifest["extender_clip_ids"] = lineage[:safe_count]
+            manifest["final_frame_count"] = _final_frame_count(segments)
         for i, desc in enumerate(segments):
             desc["validated"] = bool(i < len(clips) and clips[i].get("validated", False))
     manifest["segments"] = segments
@@ -2214,11 +2831,15 @@ def _zip_write_prefix(zf, arcname, source_path, byte_limit):
 def _build_project_archive(owner_id, requested_name, project_payload, output_path):
     project_payload = copy.deepcopy(project_payload)
     generation_mode = _generation_mode_from_project_payload(project_payload)
+    motion_context = _motion_context_from_project_payload(project_payload)
+    random_access = generation_mode == "fl2va" or (generation_mode == "ref2va" and not motion_context)
     extender_meta = project_payload.setdefault("extender", {})
     extender_meta["generation_mode"] = generation_mode
+    extender_meta["motion_context"] = bool(motion_context)
     settings_meta = extender_meta.setdefault("settings", {})
     if isinstance(settings_meta, dict):
         settings_meta["generation_mode"] = generation_mode
+        settings_meta["motion_context"] = bool(motion_context)
     refs = _refs_from_project_payload(project_payload)
     refs = _write_refs_to_project_payload(project_payload, refs)
 
@@ -2284,6 +2905,33 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             _validate_reference_file(source_path)
             frame_source_files.append((clip_index, kind, source_id, source_path))
 
+    # Ref2VA local-per-clip references are portable too. Image refs reuse the
+    # same content-addressed PNG store; local video/audio keep their original
+    # uploaded bytes in a separate content-addressed media store.
+    local_image_files = []
+    local_media_files = []
+    project_clips = _clips_from_project_payload(project_payload)
+    local_image_refs, local_media_refs = _local_ref_assets_from_clips(project_clips)
+    for ref_id in sorted(local_image_refs):
+        path = _ref_path(ref_id)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"MiniMax H3 Extender Project: local image reference {ref_id[:10]} is missing from the internal store."
+            )
+        _validate_reference_file(path)
+        local_image_files.append((ref_id, path))
+    for media_id, media in sorted(local_media_refs.items()):
+        path = _local_media_path(media_id)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"MiniMax H3 Extender Project: local {media['kind']} reference '{media['original_name']}' is missing."
+            )
+        if int(path.stat().st_size) > MAX_LOCAL_MEDIA_UPLOAD_BYTES:
+            raise ValueError(
+                f"MiniMax H3 Extender Project: local media '{media['original_name']}' exceeds the portable-project size limit."
+            )
+        local_media_files.append((media_id, media, path))
+
     # FL2VA random-access editing is append-only for speed. Save Project is the
     # natural point to force compaction so both the live cache and portable .ext
     # contain only currently referenced latent/PCM blobs.
@@ -2295,6 +2943,12 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             # an mmap handle open on the cache. In that rare case the archive is
             # still correct; it may simply include unreclaimed stale bytes.
             print(f"[WARNING] MiniMax H3 Extender: FL2VA Save Project compaction skipped: {exc}")
+    elif generation_mode == "ref2va" and not motion_context:
+        try:
+            from .ref2va_independent import compact_cache as compact_ref2va_independent_cache
+            compact_ref2va_independent_cache(owner_id, force=True)
+        except Exception as exc:
+            print(f"[WARNING] MiniMax H3 Extender: independent Ref2VA Save Project compaction skipped: {exc}")
 
     snapshot = _project_cache_snapshot(owner_id, project_payload)
     continuity_files = (
@@ -2304,6 +2958,31 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
         if generation_mode == "fl2va" and snapshot is not None
         else []
     )
+
+    final_video_files = []
+    if snapshot is not None:
+        if random_access:
+            final_dir = Path(snapshot["data_path"]).with_suffix(".fl2va.video")
+            if final_dir.exists():
+                # Save/Load must preserve the exact runtime state of a COMPUTED
+                # Full-Batch checkpoint.  The neutral per-plan .mp4 cache is the
+                # decoded checkpoint used by _ensure_plan_video_cache(); saving
+                # only .final.* sidecars forced a VideoVAE rebuild after Load
+                # even though the plan still appeared COMPUTED in the UI.
+                #
+                # Keep all video containers for live plans (.mp4/.mkv), including
+                # neutral plan caches, trimmed .prev.mp4 helpers and exact-final
+                # sidecars. Continuity PNG/JSON are already archived separately.
+                final_video_files = sorted(
+                    [
+                        p for p in final_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv"}
+                    ]
+                )
+        else:
+            final_dir = Path(snapshot["data_path"]).with_suffix(".final.video")
+            if final_dir.exists():
+                final_video_files = sorted([p for p in final_dir.iterdir() if p.is_file()])
 
     if snapshot is not None:
         cache_resolution = _resolution_from_manifest(snapshot.get("manifest"))
@@ -2331,6 +3010,8 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "original_sources": int(len(source_ref_files)),
             "fl2va_frames": int(len(frame_files)),
             "fl2va_original_sources": int(len(frame_source_files)),
+            "local_images": int(len(local_image_files)),
+            "local_media": int(len(local_media_files)),
         },
         "cache": {
             "present": snapshot is not None,
@@ -2339,6 +3020,9 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "has_committed_preview": bool(snapshot and snapshot["preview_path"].exists()),
             "has_portable_full_preview": bool(snapshot and snapshot.get("preview_is_full", False)),
             "has_decoded_audio_cache": bool(snapshot and int(snapshot.get("audio_limit", 0)) > 0),
+            "final_video_files": [
+                f"cache/final_video/{path.name}" for path in final_video_files
+            ],
             "fl2va_continuity": [
                 {
                     "clip_id": str(item["clip_id"]),
@@ -2385,6 +3069,19 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                 arcname=f"fl2va/original_clip_{clip_index}_{kind}.png",
                 compress_type=zipfile.ZIP_STORED,
             )
+        for ref_id, path in local_image_files:
+            zf.write(
+                path,
+                arcname=f"local_refs/images/{ref_id}.png",
+                compress_type=zipfile.ZIP_STORED,
+            )
+        for media_id, media, path in local_media_files:
+            zf.write(
+                path,
+                arcname=f"local_refs/media/{media_id}.bin",
+                compress_type=zipfile.ZIP_STORED,
+            )
+
         for index, item in enumerate(continuity_files, start=1):
             zf.write(
                 item["png_path"],
@@ -2395,6 +3092,13 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                 item["meta_path"],
                 arcname=f"cache/fl2va_continuity/{index:04d}.json",
                 compress_type=zipfile.ZIP_DEFLATED,
+            )
+
+        for path in final_video_files:
+            zf.write(
+                path,
+                arcname=f"cache/final_video/{path.name}",
+                compress_type=zipfile.ZIP_STORED,
             )
 
         if snapshot is not None:
@@ -2448,14 +3152,28 @@ def _zip_copy_member(zf, member_name, destination):
         os.fsync(dst.fileno())
 
 
-def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_preview=None, new_audio=None, generation_mode="ref2va"):
+def _replace_cache_transaction(
+    owner_id,
+    new_data=None,
+    new_manifest=None,
+    new_preview=None,
+    new_audio=None,
+    new_final_video_dir=None,
+    generation_mode="ref2va",
+    motion_context=True,
+):
     mode = _normalize_generation_mode(generation_mode)
-    cache_owner = _fl2va_cache_owner_id(owner_id) if mode == "fl2va" else f"extender_{_safe_name(owner_id)}"
+    random_access = mode == "fl2va" or (mode == "ref2va" and not bool(motion_context))
+    cache_owner = _project_cache_owner_id(owner_id, mode, motion_context)
     target_data, target_manifest = _chain_paths(cache_owner)
     target_preview = _decoded_preview_cache_path(target_data)
     target_preview_video = _decoded_preview_video_cache_path(target_data)
     target_audio = _decoded_audio_cache_path(target_data)
     target_fl2va_video_dir = target_data.with_suffix(".fl2va.video")
+    target_ref2va_final_video_dir = target_data.with_suffix(".final.video")
+    target_final_video_dir = (
+        target_fl2va_video_dir if random_access else target_ref2va_final_video_dir
+    )
     # The video-only preview prefix is derived and is intentionally not stored
     # in .ext. The decoded-audio cache is primary cache data and is restored
     # together with the latent chain when present.
@@ -2464,11 +3182,15 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
     token = uuid.uuid4().hex[:10]
 
     try:
-        # FL2VA per-plan decoded videos are a derived local speed cache, not part
-        # of the portable .ext payload. Never let files from the previously
-        # loaded project survive into a newly imported FL2VA latent cache.
-        if mode == "fl2va" and target_fl2va_video_dir.exists():
-            shutil.rmtree(target_fl2va_video_dir, ignore_errors=True)
+        # Exact-final sidecars are primary no-reencode cache data in v2.5.8.
+        # Move the whole directory aside transactionally so a failed project
+        # import can restore it just like the latent/audio files.
+        if target_final_video_dir.exists():
+            backup = target_final_video_dir.with_name(
+                target_final_video_dir.name + f".project_backup_{token}"
+            )
+            os.replace(target_final_video_dir, backup)
+            backups.append((target_final_video_dir, backup))
         for target in targets:
             if target.exists():
                 backup = target.with_name(target.name + f".project_backup_{token}")
@@ -2482,6 +3204,11 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
                 os.replace(str(new_preview), target_preview)
             if new_audio is not None and Path(new_audio).exists():
                 os.replace(str(new_audio), target_audio)
+            if new_final_video_dir is not None and Path(new_final_video_dir).exists():
+                target_final_video_dir.mkdir(parents=True, exist_ok=True)
+                for source in Path(new_final_video_dir).iterdir():
+                    if source.is_file():
+                        os.replace(str(source), target_final_video_dir / source.name)
         # No imported cache means an intentionally empty project. The old cache
         # remains only in backups until this transaction succeeds.
     except Exception:
@@ -2490,6 +3217,8 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
                 target.unlink(missing_ok=True)
             except Exception:
                 pass
+        if target_final_video_dir.exists():
+            shutil.rmtree(target_final_video_dir, ignore_errors=True)
         for target, backup in reversed(backups):
             if backup.exists():
                 os.replace(backup, target)
@@ -2497,7 +3226,10 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
     else:
         for _, backup in backups:
             try:
-                backup.unlink(missing_ok=True)
+                if backup.is_dir():
+                    shutil.rmtree(backup, ignore_errors=True)
+                else:
+                    backup.unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -2510,6 +3242,7 @@ def _import_project_archive(owner_id, archive_path):
     new_manifest = work_root / "chain.json"
     new_audio = work_root / "chain.audio.h3cache"
     new_preview = work_root / "chain.preview.mp4"
+    new_final_video_dir = work_root / "final_video"
     continuity_restore = []
 
     try:
@@ -2543,11 +3276,54 @@ def _import_project_archive(owner_id, archive_path):
             if not isinstance(project_payload, dict):
                 raise ValueError("MiniMax H3 Extender Project: invalid project metadata.")
             generation_mode = _generation_mode_from_project_payload(project_payload)
-            # Archives created before FL2VA have no mode marker and are always Ref2VA.
+            motion_context = _motion_context_from_project_payload(project_payload)
+            random_access = generation_mode == "fl2va" or (generation_mode == "ref2va" and not motion_context)
+            # Archives created before FL2VA/Motion toggle have no markers and are
+            # therefore classic causal Ref2VA with Motion Context enabled.
             project_payload.setdefault("extender", {})["generation_mode"] = generation_mode
+            project_payload["extender"]["motion_context"] = bool(motion_context)
             project_payload["extender"].setdefault("settings", {})["generation_mode"] = generation_mode
+            project_payload["extender"]["settings"]["motion_context"] = bool(motion_context)
             clips = _clips_from_project_payload(project_payload)
             project_prompt_pack_signature = _prompt_pack_signature_from_project_payload(project_payload)
+
+            # Restore local per-clip assets. Their ids are content hashes, so the
+            # clip JSON stays stable across machines and no slot remapping occurs.
+            local_image_refs, local_media_refs = _local_ref_assets_from_clips(clips)
+            for ref_id in sorted(local_image_refs):
+                member = f"local_refs/images/{ref_id}.png"
+                if member not in names:
+                    raise ValueError(
+                        f"MiniMax H3 Extender Project: local image reference {ref_id[:10]} is missing."
+                    )
+                info = zf.getinfo(member)
+                if int(info.file_size) > MAX_REF_UPLOAD_BYTES:
+                    raise ValueError("MiniMax H3 Extender Project: local image reference is unexpectedly large.")
+                temp_ref = work_root / f"local_image_{ref_id}.png"
+                _zip_copy_member(zf, member, temp_ref)
+                restored = _store_project_reference(
+                    temp_ref, local_image_refs[ref_id].get("original_name") or "local_ref.png"
+                )
+                if str(restored.get("id") or "") != str(ref_id):
+                    raise ValueError("MiniMax H3 Extender Project: local image reference failed its integrity check.")
+
+            for media_id, media in sorted(local_media_refs.items()):
+                member = f"local_refs/media/{media_id}.bin"
+                if member not in names:
+                    raise ValueError(
+                        f"MiniMax H3 Extender Project: local {media['kind']} reference '{media['original_name']}' is missing."
+                    )
+                info = zf.getinfo(member)
+                if int(info.file_size) > MAX_LOCAL_MEDIA_UPLOAD_BYTES:
+                    raise ValueError("MiniMax H3 Extender Project: local media reference is unexpectedly large.")
+                temp_media = work_root / f"local_media_{media_id}.bin"
+                _zip_copy_member(zf, member, temp_media)
+                if _hash_file(temp_media) != str(media_id):
+                    raise ValueError("MiniMax H3 Extender Project: local media reference failed its integrity check.")
+                _probe_media_file(temp_media, media["kind"])
+                target_media = _local_media_path(media_id)
+                if not target_media.exists():
+                    shutil.copyfile(temp_media, target_media)
 
             # v2 embeds the real reference pixels. Import each image into the
             # Extender's content-addressed store and rewrite the returned project
@@ -2627,12 +3403,30 @@ def _import_project_archive(owner_id, archive_path):
 
             if generation_mode == "fl2va":
                 for clip_index, cfg in enumerate(clips, start=1):
-                    for kind in ("first", "last"):
-                        key = f"{kind}_frame"
-                        saved = cfg.get(key)
-                        member = f"fl2va/clip_{clip_index}_{kind}.png"
+                    targets = [
+                        ("first", cfg.get("first_frame"), ("frame", "first_frame")),
+                        ("last", cfg.get("last_frame"), ("frame", "last_frame")),
+                    ]
+                    for guide_index, guide in enumerate(cfg.get("guides") or []):
+                        if isinstance(guide, dict):
+                            targets.append(
+                                (f"guide_{guide_index + 1}", guide.get("frame"), ("guide", guide_index))
+                            )
+
+                    for kind, saved, assign_target in targets:
                         if saved is None:
                             continue
+                        archive_kind = kind
+                        member = f"fl2va/clip_{clip_index}_{archive_kind}.png"
+                        # v2.2.x portable projects stored their only AddGuide
+                        # image under the legacy unsuffixed guide filename.
+                        if (
+                            kind == "guide_1"
+                            and member not in names
+                            and f"fl2va/clip_{clip_index}_guide.png" in names
+                        ):
+                            archive_kind = "guide"
+                            member = f"fl2va/clip_{clip_index}_guide.png"
                         if member not in names:
                             raise ValueError(
                                 f"MiniMax H3 Extender Project: embedded FL2VA clip {clip_index} {kind} frame is missing."
@@ -2658,7 +3452,7 @@ def _import_project_archive(owner_id, archive_path):
                             if isinstance(saved, dict)
                             else desc["id"]
                         )
-                        source_member = f"fl2va/original_clip_{clip_index}_{kind}.png"
+                        source_member = f"fl2va/original_clip_{clip_index}_{archive_kind}.png"
                         if source_member in names:
                             source_info = zf.getinfo(source_member)
                             if int(source_info.file_size) > MAX_REF_UPLOAD_BYTES:
@@ -2688,7 +3482,12 @@ def _import_project_archive(owner_id, archive_path):
                                     )
                                 except Exception:
                                     desc[adjustment_key] = 100.0
-                        cfg[key] = desc
+
+                        target_type, target_value = assign_target
+                        if target_type == "frame":
+                            cfg[target_value] = desc
+                        else:
+                            cfg["guides"][int(target_value)]["frame"] = desc
                 _write_clips_to_project_payload(project_payload, clips, generation_mode)
 
             has_data = "cache/chain.h3cache" in names
@@ -2704,6 +3503,20 @@ def _import_project_archive(owner_id, archive_path):
                     _zip_copy_member(zf, "cache/chain.audio.h3cache", new_audio)
                 if "cache/chain.preview.mp4" in names:
                     _zip_copy_member(zf, "cache/chain.preview.mp4", new_preview)
+
+                final_members = sorted(
+                    name for name in names
+                    if name.startswith("cache/final_video/") and not name.endswith("/")
+                )
+                if final_members:
+                    new_final_video_dir.mkdir(parents=True, exist_ok=True)
+                    for member in final_members:
+                        base = Path(member).name
+                        if not base or base != member.split("/")[-1]:
+                            raise ValueError(
+                                "MiniMax H3 Extender Project: invalid final video cache entry."
+                            )
+                        _zip_copy_member(zf, member, new_final_video_dir / base)
 
                 imported_manifest = _load_manifest_from_paths(new_data, new_manifest)
                 if imported_manifest is None:
@@ -2729,13 +3542,13 @@ def _import_project_archive(owner_id, archive_path):
                 # Ref2VA projects retain the portable sequential prefix. FL2VA
                 # projects use stable clip ids and therefore filter/reorder the
                 # manifest without rewriting the append-only latent bytes.
-                if generation_mode == "ref2va" and len(imported_manifest.get("segments", [])) > len(clips):
+                if generation_mode == "ref2va" and motion_context and len(imported_manifest.get("segments", [])) > len(clips):
                     imported_manifest = _truncate_chain(
                         new_data, new_manifest, imported_manifest, len(clips)
                     )
 
                 segments = [dict(x) for x in imported_manifest.get("segments", [])]
-                if generation_mode == "fl2va":
+                if random_access:
                     order = {str(c.get("id")): i for i, c in enumerate(clips)}
                     valid = {str(c.get("id")): bool(c.get("validated", False)) for c in clips}
                     segments = [x for x in segments if str(x.get("clip_id") or "") in order]
@@ -2750,11 +3563,12 @@ def _import_project_archive(owner_id, archive_path):
                 imported_manifest = dict(imported_manifest)
                 imported_manifest["segments"] = segments
                 imported_manifest["final_frame_count"] = _final_frame_count(segments)
-                imported_manifest["sequence_mode"] = generation_mode
-                imported_manifest["owner_id"] = (
-                    _fl2va_cache_owner_id(owner_id)
-                    if generation_mode == "fl2va"
-                    else f"extender_{_safe_name(owner_id)}"
+                imported_manifest["sequence_mode"] = (
+                    "fl2va" if generation_mode == "fl2va"
+                    else ("ref2va_independent" if not motion_context else "ref2va")
+                )
+                imported_manifest["owner_id"] = _project_cache_owner_id(
+                    owner_id, generation_mode, motion_context
                 )
                 imported_manifest["imported_at"] = time.time()
                 imported_manifest["updated_at"] = time.time()
@@ -2832,7 +3646,7 @@ def _import_project_archive(owner_id, archive_path):
 
             cached_count = int(len(imported_manifest.get("segments", []))) if imported_manifest else 0
             # A clip can only remain validated when its physical cached segment is present.
-            if generation_mode == "fl2va":
+            if random_access:
                 cached_ids = {
                     str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
                     if str(x.get("clip_id") or "")
@@ -2850,14 +3664,18 @@ def _import_project_archive(owner_id, archive_path):
                     elif not clip_cfg["validated"]:
                         found_open = True
 
-            normalized_clips_json = _state_json(clips, project_prompt_pack_signature, generation_mode)
+            normalized_clips_json = _state_json(
+                clips, project_prompt_pack_signature, generation_mode, motion_context=motion_context
+            )
             extender_payload = project_payload.setdefault("extender", {})
             extender_payload["generation_mode"] = generation_mode
+            extender_payload["motion_context"] = bool(motion_context)
             extender_payload["clips_json"] = normalized_clips_json
             extender_payload["clips"] = clips
             settings = extender_payload.setdefault("settings", {})
             if isinstance(settings, dict):
                 settings["generation_mode"] = generation_mode
+                settings["motion_context"] = bool(motion_context)
                 settings["clips_json"] = normalized_clips_json
 
             _replace_cache_transaction(
@@ -2866,8 +3684,43 @@ def _import_project_archive(owner_id, archive_path):
                 new_manifest if imported_manifest is not None else None,
                 new_preview if imported_manifest is not None and new_preview.exists() else None,
                 new_audio if imported_manifest is not None and new_audio.exists() else None,
+                new_final_video_dir=(
+                    new_final_video_dir
+                    if imported_manifest is not None and new_final_video_dir.exists()
+                    else None
+                ),
                 generation_mode=generation_mode,
+                motion_context=motion_context,
             )
+
+            # Portable .ext projects are intentionally single-mode/context. The frontend
+            # also resets the inactive card timeline when importing one, so an
+            # old cache from the opposite mode must not survive on disk. If it
+            # did, a later frontend/default-mode mistake could resurrect a stale
+            # preview from a completely different project after F5/restart.
+            active_cache_key = (generation_mode, bool(motion_context) if generation_mode == "ref2va" else False)
+            inactive_cache_keys = [
+                ("ref2va", True),
+                ("ref2va", False),
+                ("fl2va", False),
+            ]
+            for inactive_mode, inactive_motion in inactive_cache_keys:
+                if (inactive_mode, inactive_motion) == active_cache_key:
+                    continue
+                try:
+                    _replace_cache_transaction(
+                        owner_id, generation_mode=inactive_mode, motion_context=inactive_motion
+                    )
+                except Exception as exc:
+                    label = (
+                        "ref2va-motion" if inactive_mode == "ref2va" and inactive_motion
+                        else ("ref2va-independent" if inactive_mode == "ref2va" else "fl2va")
+                    )
+                    print(
+                        f"[WARNING] MiniMax H3 Extender: could not clear stale {label} "
+                        f"cache while loading project: {exc}"
+                    )
+
             if generation_mode == "fl2va" and imported_manifest is not None and continuity_restore:
                 target_data, _ = _chain_paths(_fl2va_cache_owner_id(owner_id))
                 for clip_id, png_path, json_path in continuity_restore:
@@ -2893,7 +3746,7 @@ def _import_project_archive(owner_id, archive_path):
 
             validated_count = 0
             if imported_manifest is not None:
-                if generation_mode == "fl2va":
+                if random_access:
                     validated_count = sum(bool(x.get("validated", False)) for x in imported_manifest.get("segments", []))
                 else:
                     for desc in imported_manifest.get("segments", []):
@@ -2921,6 +3774,23 @@ def _import_project_archive(owner_id, archive_path):
                         str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
                         if str(x.get("clip_id") or "") and bool(x.get("validated", False))
                     ],
+                    "computed_indices": [
+                        i for i, x in enumerate((imported_manifest or {}).get("segments", []))
+                        if bool(x.get("computed", False)) and not bool(x.get("validated", False))
+                    ],
+                    "computed_clip_ids": [
+                        str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
+                        if str(x.get("clip_id") or "") and bool(x.get("computed", False)) and not bool(x.get("validated", False))
+                    ],
+                    "checkpoint_active": bool(
+                        imported_manifest
+                        and (
+                            imported_manifest.get("batch_in_progress", False)
+                            or imported_manifest.get("batch_interrupted", False)
+                        )
+                    ),
+                    "checkpoint_interrupted": bool(imported_manifest and imported_manifest.get("batch_interrupted", False)),
+                    "checkpoint_snapshot_count": int(imported_manifest.get("batch_snapshot_count", 0) or 0) if imported_manifest else 0,
                     "continuity_signatures": loaded_continuity_signatures,
                     "frame_count": int(imported_manifest.get("final_frame_count", 0)) if imported_manifest else 0,
                     "resolved_width": int(loaded_resolution["width"]) if loaded_resolution else 0,
@@ -3024,7 +3894,13 @@ class MiniMaxH3Extender:
                 ["ref2va", "fl2va"],
                 {"default": "ref2va"},
             ),
-            # PDD Acc (optional acceleration). Appended after generation_mode so
+            # Appended after every legacy widget. The frontend hides this native
+            # boolean and exposes a compact Ref2VA-only MOTION toggle.
+            "motion_context": (
+                "BOOLEAN",
+                {"default": True, "tooltip": "Ref2VA only: chain clips with Motion Context. Disable for independent random-access clips."},
+            ),
+            # PDD Acc (optional acceleration). Appended after motion_context so
             # older positional widget arrays keep their original mapping.
             "pdd_acc_lora": (
                 pdd_acc_choices(),
@@ -3238,7 +4114,7 @@ class MiniMaxH3Extender:
         return {
             "required": required,
             "optional": optional,
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     RETURN_TYPES = (CACHE_TYPE, "INT", "INT", "STRING", "FLOAT", "STRING")
@@ -3292,6 +4168,7 @@ class MiniMaxH3Extender:
         fl2va_model,
         clip,
         vae,
+        audio_vae,
         run_mode,
         width,
         height,
@@ -3301,6 +4178,7 @@ class MiniMaxH3Extender:
         denoise,
         resolution_mode,
         megapixels,
+        export_profile,
         pdd_acc_lora="None",
         pdd_nfe="8",
         pdd_lora_strength=1.0,
@@ -3334,6 +4212,13 @@ class MiniMaxH3Extender:
                 frame_guides.append(cfg.get("first_frame"))
             elif cfg.get("last_frame") is not None:
                 frame_guides.append(cfg.get("last_frame"))
+            else:
+                first_guide = next(
+                    (g.get("frame") for g in (cfg.get("guides") or []) if isinstance(g, dict) and g.get("frame") is not None),
+                    None,
+                )
+                if first_guide is not None:
+                    frame_guides.append(first_guide)
         requested_resolution = _resolve_generation_resolution(
             resolution_mode, megapixels, width, height, frame_guides
         )
@@ -3376,10 +4261,26 @@ class MiniMaxH3Extender:
         # card ids, which is what makes insert/remove/reorder independent of the
         # physical append-only latent file.
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
+        manifest, active_export_profile = _pin_full_batch_export_profile(
+            manifest_path, manifest, run_mode, export_profile
+        )
+        clear_full_batch_interrupt(owner, "fl2va")
+        manifest, _resume_checkpoint = _begin_batch_checkpoint(
+            manifest_path, manifest, run_mode
+        )
         cached_ids = cached_fl2va_ids(manifest)
         generated = []
         statuses = []
         previous_handle = None
+        interrupted = False
+        interrupted_after = 0
+
+        if str(run_mode) == "full_batch":
+            _LOG.info(
+                "H3 Full Batch FL2VA start: validated=%s cached_ids=%s",
+                [bool(c.get("validated", False)) for c in clips],
+                sorted(str(x) for x in cached_ids),
+            )
 
         def _dependent_indices(after_index):
             out = []
@@ -3404,6 +4305,18 @@ class MiniMaxH3Extender:
             cached_ids = cached_fl2va_ids(manifest)
 
         for i, cfg in enumerate(clips):
+            # A request can arrive immediately after the previous clip emitted
+            # its COMPLETE event. Check again before preparing the next card so
+            # "Interrupt" never starts one extra expensive sample by accident.
+            if (
+                str(run_mode) == "full_batch"
+                and i > 0
+                and full_batch_interrupt_requested(owner, "fl2va", consume=True)
+            ):
+                interrupted = True
+                interrupted_after = i
+                break
+
             clip_id = clip_ids[i]
             first_source = (
                 "previous_clip"
@@ -3443,16 +4356,90 @@ class MiniMaxH3Extender:
                         or str(current_desc.get("previous_frame_signature") or "") != str(dependency_meta["previous_frame_signature"])
                     )
             if stale_dependency:
-                _drop_stale_indices([i] + _dependent_indices(i))
+                stale_indices = [i] + _dependent_indices(i)
+                locked = [idx for idx in stale_indices if bool(clips[idx].get("validated", False))]
+                if locked:
+                    if first_frame is not None:
+                        del first_frame
+                    labels = ", ".join(str(idx + 1) for idx in locked)
+                    raise RuntimeError(
+                        "MiniMax H3 Extender: FL2VA Previous dependency changed for "
+                        f"Validated clip(s) {labels}. Refusing to invalidate or rerender "
+                        "a validated clip automatically. Uncheck Validated explicitly on "
+                        "the affected clip(s) before rerunning."
+                    )
+                _drop_stale_indices(stale_indices)
                 current_desc = None
                 cached = False
 
-            if bool(cfg.get("validated")) and cached:
+            if bool(cfg.get("validated", False)):
+                if not cached or current_desc is None:
+                    if first_frame is not None:
+                        del first_frame
+                    raise RuntimeError(
+                        f"MiniMax H3 Extender: FL2VA clip {i + 1} is marked Validated "
+                        "but its plan cache is missing. Refusing to rerender a validated clip. "
+                        "Uncheck Validated explicitly if you want this clip rendered again."
+                    )
+                _LOG.info(
+                    "H3 validated hard-skip: FL2VA clip %d exists on disk; sampler forbidden",
+                    i + 1,
+                )
                 if first_frame is not None:
                     del first_frame
                 continue
-            if bool(cfg.get("validated")) and not cached:
-                cfg["validated"] = False
+
+            if (
+                str(run_mode) == "full_batch"
+                and cached
+                and current_desc is not None
+                and bool(current_desc.get("computed", False))
+                and not bool(current_desc.get("validated", False))
+            ):
+                _LOG.info(
+                    "H3 COMPUTED hard-reuse: FL2VA clip %d exists on disk; sampler forbidden",
+                    i + 1,
+                )
+                _send_extender_progress(
+                    owner, i, len(clips), "sampling",
+                    f"Checking FL2VA checkpoint {i + 1}/{len(clips)}",
+                )
+                manifest, _cache_info = cache_full_batch_fl2va_plan(
+                    owner, float(FPS), clip_ids, clip_id, vae, audio_vae=audio_vae,
+                    export_profile=active_export_profile,
+                    color_adjustment=cfg.get("color_adjustment"),
+                    handoff_enabled=(
+                        i + 1 < len(clips)
+                        and str(clips[i + 1].get("first_source") or "manual") == "previous_clip"
+                    ),
+                )
+                statuses.append(f"FL2VA clip {i + 1} resumed from checkpoint")
+                if first_frame is not None:
+                    del first_frame
+                continue
+
+            if bool(cfg.get("validated", False)):
+                raise RuntimeError(
+                    f"MiniMax H3 Extender invariant: FL2VA clip {i + 1} reached the sampler path while Validated."
+                )
+
+            # Rerendering this plan changes the actual frame inherited by every
+            # consecutive Previous-linked follower. A Validated follower is a
+            # hard user lock: never clear it after sampling behind the user's
+            # back. Require explicit de-validation before the upstream rerender.
+            dependent = _dependent_indices(i)
+            locked_dependents = [
+                idx for idx in dependent if bool(clips[idx].get("validated", False))
+            ]
+            if locked_dependents:
+                if first_frame is not None:
+                    del first_frame
+                labels = ", ".join(str(idx + 1) for idx in locked_dependents)
+                raise RuntimeError(
+                    f"MiniMax H3 Extender: rerendering FL2VA clip {i + 1} would invalidate "
+                    f"Validated Previous-linked clip(s) {labels}. Refusing to rerender. "
+                    "Uncheck Validated explicitly on the affected dependent clip(s) first."
+                )
 
             _send_extender_progress(
                 owner, i, len(clips), "preparing",
@@ -3464,6 +4451,17 @@ class MiniMaxH3Extender:
             if first_source == "manual":
                 first_frame = _load_reference_tensor(first_desc) if first_desc is not None else None
             last_frame = _load_reference_tensor(last_desc) if last_desc is not None else None
+            guide_frames = []
+            for guide_cfg in cfg.get("guides") or []:
+                if not isinstance(guide_cfg, dict):
+                    continue
+                guide_desc = guide_cfg.get("frame")
+                if guide_desc is None:
+                    continue
+                guide_frames.append({
+                    "frame": _load_reference_tensor(guide_desc),
+                    "frame_idx": int(guide_cfg.get("frame_idx", 0) or 0),
+                })
 
             clip_model, clip_text_encoder = _apply_per_clip_loras(
                 self, fl2va_model, clip, cfg.get("loras"), i
@@ -3477,6 +4475,7 @@ class MiniMaxH3Extender:
                 frame_count,
                 first_frame=first_frame,
                 last_frame=last_frame,
+                guide_frames=guide_frames,
             )
 
             _send_extender_progress(
@@ -3504,11 +4503,40 @@ class MiniMaxH3Extender:
                 validated=False,
                 run_mode=str(run_mode),
                 dependency_meta=dependency_meta,
+                computed=(str(run_mode) == "full_batch"),
             )
             statuses.append(cache_status)
             cached_ids.add(clip_id)
             generated.append(i)
             cfg["validated"] = False
+
+            # Sampling is safely persisted now. Release the large generation
+            # tensors before staging VideoVAE for the resumable decoded cache.
+            del sampled, positive, latent, clip_model, clip_text_encoder
+            if first_frame is not None:
+                del first_frame
+            if last_frame is not None:
+                del last_frame
+            for guide_item in guide_frames:
+                guide_tensor = guide_item.get("frame") if isinstance(guide_item, dict) else None
+                if guide_tensor is not None:
+                    del guide_tensor
+            guide_frames.clear()
+
+            if str(run_mode) == "full_batch":
+                _send_extender_progress(
+                    owner, i, len(clips), "sampling",
+                    f"Caching FL2VA clip {i + 1}/{len(clips)}",
+                )
+                manifest, _cache_info = cache_full_batch_fl2va_plan(
+                    owner, float(FPS), clip_ids, clip_id, vae, audio_vae=audio_vae,
+                    export_profile=active_export_profile,
+                    color_adjustment=cfg.get("color_adjustment"),
+                    handoff_enabled=(
+                        i + 1 < len(clips)
+                        and str(clips[i + 1].get("first_source") or "manual") == "previous_clip"
+                    ),
+                )
 
             # Rerendering an upstream plan changes the real image used by every
             # consecutive Previous-linked follower. Their latent caches are now
@@ -3521,11 +4549,14 @@ class MiniMaxH3Extender:
                 owner, i, len(clips), "complete",
                 f"FL2VA clip {i + 1}/{len(clips)} complete",
             )
-            del sampled, positive, latent, clip_model, clip_text_encoder
-            if first_frame is not None:
-                del first_frame
-            if last_frame is not None:
-                del last_frame
+
+            if (
+                str(run_mode) == "full_batch"
+                and full_batch_interrupt_requested(owner, "fl2va", consume=True)
+            ):
+                interrupted = True
+                interrupted_after = i + 1
+                break
 
             if str(run_mode) == "clip_by_clip":
                 break
@@ -3538,6 +4569,22 @@ class MiniMaxH3Extender:
             owner, FPS, clip_ids, validation_by_id, run_mode=str(run_mode)
         )
 
+        if str(run_mode) == "full_batch":
+            if interrupted:
+                final_manifest = _interrupt_batch_checkpoint(
+                    manifest_path,
+                    final_manifest,
+                    interrupted_after,
+                    len(clips),
+                )
+                previous_handle = dict(previous_handle)
+                previous_handle["interrupted"] = True
+                previous_handle["snapshot_count"] = int(interrupted_after)
+                previous_handle["project_total_clips"] = int(len(clips))
+                previous_handle["status"] = f"interrupted after clip {int(interrupted_after)}"
+            else:
+                final_manifest = _finish_batch_checkpoint(manifest_path, final_manifest)
+
         # Keep per-plan color metadata aligned by stable clip id.
         color_segments = [dict(x) for x in final_manifest.get("segments", [])]
         clip_by_id = {clip_ids[i]: clips[i] for i in range(len(clips))}
@@ -3549,6 +4596,7 @@ class MiniMaxH3Extender:
             wanted = _normalize_color_adjustment(cfg.get("color_adjustment"))
             if desc.get("color_adjustment") != wanted:
                 desc["color_adjustment"] = wanted
+                desc["final_video_dirty"] = True
                 color_segments[idx] = desc
                 color_changed = True
         if color_changed:
@@ -3565,6 +4613,7 @@ class MiniMaxH3Extender:
         }
         cached_count = len(cached_ids)
         validated_count = len(validated_ids)
+        computed_clip_ids = _fl2va_computed_ids(final_manifest)
         continuity_signatures = continuity_signatures_for_segments(
             data_path, final_manifest.get("segments", [])
         )
@@ -3595,6 +4644,8 @@ class MiniMaxH3Extender:
                 if generated else "disk only"
             )
         )
+        if interrupted:
+            status += f" | INTERRUPTED after clip {int(interrupted_after)} | checkpoint saved"
         cache_mb = _cache_size_mb(data_path, manifest_path)
         final_cache_resolution = _resolution_from_manifest(final_manifest)
 
@@ -3607,6 +4658,11 @@ class MiniMaxH3Extender:
             "validated_count": validated_count,
             "cached_clip_ids": sorted(cached_ids),
             "validated_clip_ids": sorted(validated_ids),
+            "computed_clip_ids": sorted(computed_clip_ids),
+            "computed_indices": [],
+            "checkpoint_active": bool(interrupted),
+            "checkpoint_interrupted": bool(interrupted),
+            "checkpoint_snapshot_count": int(interrupted_after if interrupted else 0),
             "continuity_signatures": continuity_signatures,
             "generated": [i + 1 for i in generated],
             "status": status,
@@ -3662,6 +4718,7 @@ class MiniMaxH3Extender:
         megapixels=DEFAULT_MEGAPIXELS,
         refs_json=None,
         generation_mode="ref2va",
+        motion_context=True,
         pdd_acc_lora="None",
         pdd_nfe="8",
         pdd_lora_strength=1.0,
@@ -3675,12 +4732,14 @@ class MiniMaxH3Extender:
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
+        prompt=None,
         **kwargs,
     ):
         generation_mode = _normalize_generation_mode(generation_mode)
+        motion_context = bool(motion_context)
         run_refine = _coerce_bool(run_refine, False)
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
-        clips = _parse_clips_json(clips_json, generation_mode)
+        clips = _parse_clips_json(clips_json, generation_mode, motion_context)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
         clips, active_prompt_pack_signature, prompt_pack_imported, _prompt_pack_count_changed = (
             _sync_clips_from_prompt_pack(
@@ -3697,6 +4756,12 @@ class MiniMaxH3Extender:
             raise ValueError(
                 "MiniMax H3 Extender: run_refine is currently supported for REF2VA only."
             )
+        if bool(run_refine) and not motion_context:
+            raise ValueError(
+                "MiniMax H3 Extender: run_refine requires Ref2VA Motion Context (causal draft cache)."
+            )
+
+        requested_export_profile = _final_decode_profile_from_prompt(prompt, owner)
 
         if generation_mode == "fl2va":
             return self._extend_fl2va(
@@ -3709,6 +4774,7 @@ class MiniMaxH3Extender:
                 fl2va_model=kwargs.get("fl2va_model"),
                 clip=clip,
                 vae=vae,
+                audio_vae=kwargs.get("audio_vae"),
                 run_mode=run_mode,
                 width=width,
                 height=height,
@@ -3718,6 +4784,26 @@ class MiniMaxH3Extender:
                 denoise=denoise,
                 resolution_mode=resolution_mode,
                 megapixels=megapixels,
+                export_profile=requested_export_profile,
+                pdd_acc_lora=pdd_acc_lora,
+                pdd_nfe=pdd_nfe,
+                pdd_lora_strength=pdd_lora_strength,
+                pdd_head_strength=pdd_head_strength,
+            )
+
+        if not motion_context:
+            return _run_ref2va_independent(
+                self, owner=owner, clips=clips,
+                active_prompt_pack_signature=active_prompt_pack_signature,
+                prompt_pack_imported=prompt_pack_imported,
+                external_prompt_pack=external_prompt_pack,
+                model=model, clip=clip, vae=vae, audio_vae=kwargs.get("audio_vae"),
+                run_mode=run_mode, width=width, height=height,
+                ref_image_size=ref_image_size, steps=steps,
+                sampler_name=sampler_name, scheduler=scheduler, denoise=denoise,
+                resolution_mode=resolution_mode, megapixels=megapixels,
+                refs_json=refs_json, ref_pack=ref_pack,
+                export_profile=requested_export_profile, kwargs=kwargs,
                 pdd_acc_lora=pdd_acc_lora,
                 pdd_nfe=pdd_nfe,
                 pdd_lora_strength=pdd_lora_strength,
@@ -3734,25 +4820,27 @@ class MiniMaxH3Extender:
 
         segments = manifest.get("segments", [])
 
-        # A TRUE toggle can only validate a clip that actually exists on disk.
-        # This also protects old workflow JSON with stale downstream TRUE values.
-        if len(segments) < len(clips):
-            for i in range(len(segments), len(clips)):
-                if clips[i]["validated"]:
-                    for j in range(i, len(clips)):
-                        clips[j]["validated"] = False
-                    break
+        # Never silently turn a user-validated clip back into an active clip.
+        # The loop below enforces the hard invariant: Validated=True can only be
+        # reused from disk; if its cache is missing we stop with an explicit
+        # error instead of falling through to the sampler.
 
         refs = _parse_refs_json(refs_json)
         external_ref_pack = _normalize_external_ref_pack(ref_pack)
-        refs, ref_pack_imported_slots = _sync_refs_from_ref_pack(refs, external_ref_pack)
-        if ref_pack_imported_slots and external_ref_pack is not None:
+        local_picture_slots = _local_picture_slot_reservations(clips)
+        refs, ref_pack_imported_slots, ref_pack_skipped_slots = _sync_refs_from_ref_pack(
+            refs,
+            external_ref_pack,
+            local_picture_slots,
+        )
+        if (ref_pack_imported_slots or ref_pack_skipped_slots) and external_ref_pack is not None:
             _send_extender_ref_pack_import(
                 owner,
                 _refs_json(refs),
                 ref_pack_imported_slots,
                 int(external_ref_pack.get("count", 0) or 0),
                 external_ref_pack.get("source") or "External reference pack",
+                skipped_slots=ref_pack_skipped_slots,
             )
         refs_signature = _refs_signature(refs)
         requested_resolution = _resolve_generation_resolution(
@@ -3853,6 +4941,14 @@ class MiniMaxH3Extender:
         manifest["updated_at"] = time.time()
         _write_json_atomic(manifest_path, manifest)
 
+        manifest, active_export_profile = _pin_full_batch_export_profile(
+            manifest_path, manifest, run_mode, requested_export_profile
+        )
+        clear_full_batch_interrupt(owner, "ref2va")
+        manifest, _resume_checkpoint = _begin_batch_checkpoint(
+            manifest_path, manifest, run_mode
+        )
+
         resolution_mismatch = False
 
         audio_vae = kwargs.get("audio_vae")
@@ -3873,6 +4969,7 @@ class MiniMaxH3Extender:
         # after the duration previously consumed from Audio 1.
         standalone_audio_clip_plan = _build_standalone_audio_clip_plan(clips, ref_audios)
         standalone_audio_cache = {}
+        local_media_decode_cache = {}
 
         ref_items = None
         ref_blocks = None
@@ -3904,6 +5001,15 @@ class MiniMaxH3Extender:
         previous_proxy = None
         generated = []
         statuses = []
+        interrupted = False
+        interrupted_after = 0
+
+        if str(run_mode) == "full_batch":
+            _LOG.info(
+                "H3 Full Batch Ref2VA start: validated=%s cached_segments=%d",
+                [bool(c.get("validated", False)) for c in clips],
+                len((_load_manifest_from_paths(data_path, manifest_path) or {}).get("segments", [])),
+            )
 
         if bool(run_refine):
             from .latent_refine import run_refine_pass
@@ -4014,13 +5120,37 @@ class MiniMaxH3Extender:
         # Walk the card list in order. Cached TRUE clips are metadata-only;
         # active clips sample and are written immediately to disk.
         for i, cfg in enumerate(clips):
+            if (
+                str(run_mode) == "full_batch"
+                and i > 0
+                and full_batch_interrupt_requested(owner, "ref2va", consume=True)
+            ):
+                interrupted = True
+                interrupted_after = i
+                break
+
             # Refresh manifest state every iteration because Disk Join can
             # truncate or append the physical chain.
             current_manifest = _load_manifest_from_paths(data_path, manifest_path)
             existing_count = len(current_manifest.get("segments", [])) if current_manifest else 0
             existing = i < existing_count
+            current_desc = (
+                dict(current_manifest.get("segments", [])[i])
+                if current_manifest is not None and existing
+                else None
+            )
 
-            if cfg["validated"] and existing:
+            if bool(cfg.get("validated", False)):
+                if not existing or current_desc is None:
+                    raise RuntimeError(
+                        f"MiniMax H3 Extender: Ref2VA clip {i + 1} is marked Validated "
+                        "but its disk cache is missing. Refusing to rerender a validated clip. "
+                        "Uncheck Validated explicitly if you want this clip rendered again."
+                    )
+                _LOG.info(
+                    "H3 validated hard-skip: Ref2VA clip %d exists on disk; sampler forbidden",
+                    i + 1,
+                )
                 result = disk_join.join(
                     samples=None,
                     trim_frames=None,
@@ -4034,6 +5164,49 @@ class MiniMaxH3Extender:
                 previous_proxy = result[1]
                 statuses.append(result[4])
                 continue
+
+            if (
+                str(run_mode) == "full_batch"
+                and existing
+                and current_desc is not None
+                and bool(current_desc.get("computed", False))
+                and not bool(current_desc.get("validated", False))
+            ):
+                _LOG.info(
+                    "H3 COMPUTED hard-reuse: Ref2VA clip %d exists on disk; sampler forbidden",
+                    i + 1,
+                )
+                result = disk_join.join(
+                    samples=None,
+                    trim_frames=None,
+                    validated=False,
+                    run_mode=str(run_mode),
+                    fps=float(FPS),
+                    previous_cache=previous_handle,
+                    unique_id=f"extender_{owner}",
+                    reuse_existing=True,
+                )
+                previous_handle = result[0]
+                previous_proxy = result[1]
+                statuses.append(result[4])
+                _send_extender_progress(
+                    owner, i, len(clips), "sampling",
+                    f"Checking Ref2VA checkpoint {i + 1}/{len(clips)}",
+                )
+                cache_full_batch_ref2va_segment(
+                    data_path, manifest_path, i, vae, audio_vae, float(FPS),
+                    export_profile=active_export_profile,
+                    color_adjustment=cfg.get("color_adjustment"),
+                )
+                continue
+
+            # Reaching this point with Validated=True is a programming error.
+            # Never recover by sampling: validated clips are immutable until the
+            # user explicitly unchecks them.
+            if bool(cfg.get("validated", False)):
+                raise RuntimeError(
+                    f"MiniMax H3 Extender invariant: Ref2VA clip {i + 1} reached the sampler path while Validated."
+                )
 
             # Any active clip is unvalidated. Make sure everything after it is
             # false in the serialized state as well.
@@ -4050,80 +5223,152 @@ class MiniMaxH3Extender:
 
             frame_count = _duration_to_frames(cfg["duration"])
 
-            # Standalone Audio selection is deterministic per clip. One connected
-            # ref remains the global/timeline ref regardless of prompt tags. With
-            # several refs, <Audio N> selects explicitly; without a usable tag,
-            # the first connected logical ref is used instead of stacking them.
+            # Global references keep their historical semantics. Local references
+            # are clip-only additions that occupy still-free logical Picture/Video/Audio
+            # slots; they never replace/remap a global slot silently.
+            local_refs = _normalize_local_refs(cfg.get("local_refs"))
+            clip_refs = list(refs)
+            clip_ref_videos = list(ref_videos)
+            clip_ref_video_fps = list(ref_video_fps)
+            clip_ref_video_audios = list(ref_video_audios)
+
+            local_visual = False
+            for item in local_refs.get("images", []):
+                slot = int(item["slot"])
+                if clip_refs[slot - 1] is not None:
+                    _LOG.warning(
+                        "H3 Extender: Clip %d local Picture %d overrides a conflicting global Picture %d for this clip.",
+                        i + 1,
+                        slot,
+                        slot,
+                    )
+                clip_refs[slot - 1] = item["ref"]
+                local_visual = True
+
+            for item in local_refs.get("videos", []):
+                slot = int(item["slot"])
+                if clip_ref_videos[slot - 1] is not None:
+                    _LOG.warning(
+                        "H3 Extender: Clip %d local Video %d overrides a conflicting global Video %d for this clip.",
+                        i + 1,
+                        slot,
+                        slot,
+                    )
+                clip_ref_videos[slot - 1] = _load_local_video_media(
+                    item["media"], frame_count, cache=local_media_decode_cache
+                )
+                clip_ref_video_fps[slot - 1] = float(FPS)
+                clip_ref_video_audios[slot - 1] = None
+                local_visual = True
+
+            # Standalone global Audio selection remains exactly as before. Local
+            # Audio refs are explicit per-card additions and therefore always used
+            # by that card, at source offset zero.
             selected_ref_audios, selected_audio_slots, selected_audio_offsets = standalone_audio_clip_plan[i]
+            selected_ref_audios = list(selected_ref_audios)
+            selected_audio_slots = list(selected_audio_slots)
+            selected_audio_offsets = dict(selected_audio_offsets)
+            for item in local_refs.get("audios", []):
+                slot = int(item["slot"])
+                if ref_audios[slot - 1] is not None:
+                    _LOG.warning(
+                        "H3 Extender: Clip %d local Audio %d overrides a conflicting global Audio %d for this clip.",
+                        i + 1,
+                        slot,
+                        slot,
+                    )
+                selected_ref_audios[slot - 1] = _load_local_audio_media(
+                    item["media"], cache=local_media_decode_cache
+                )
+                if slot not in selected_audio_slots:
+                    selected_audio_slots.append(slot)
+                selected_audio_offsets[slot] = 0.0
+            selected_audio_slots = sorted(set(int(x) for x in selected_audio_slots))
             selected_ref_audio_count = len(selected_audio_slots)
+
+            active_clip_video_count = sum(video is not None for video in clip_ref_videos)
             clip_mixed_ref_count = (
-                _reference_count(refs)
-                + active_ref_video_count
+                _reference_count(clip_refs)
+                + active_clip_video_count
                 + selected_ref_audio_count
             )
             if clip_mixed_ref_count > MAX_MIXED_REF_ITEMS:
                 raise ValueError(
-                    f"MiniMax H3 Extender: H3 Ref2VA supports at most {MAX_MIXED_REF_ITEMS} mixed reference items for this clip; "
-                    f"got {clip_mixed_ref_count}."
+                    f"MiniMax H3 Extender: Clip {i + 1} has {clip_mixed_ref_count} mixed references; "
+                    f"MiniMax H3 supports at most {MAX_MIXED_REF_ITEMS}."
                 )
 
-            # Reference-video conditioning is cropped/aligned against the target
-            # clip duration. Reuse the prepared payload while duration is the
-            # same, but rebuild it if a later card uses a different frame count.
-            needs_ref_prepare = (
-                ref_items is None
-                or ref_blocks is None
-                or active_picture_slots is None
-                or active_video_slots is None
-                or (active_ref_video_count and prepared_ref_frame_count != frame_count)
-            )
-            if needs_ref_prepare:
-                cached_video_blocks = prepared_video_blocks_by_frame_count.get(int(frame_count))
-                ref_items, ref_blocks, active_picture_slots, active_video_slots = _prepare_shared_refs(
+            if local_visual:
+                # Beta path: only clips that own local image/video refs rebuild
+                # visual conditioning. Clips without locals keep the optimized
+                # global-reference cache unchanged.
+                clip_base_items, clip_base_blocks, clip_picture_slots, clip_video_slots = _prepare_shared_refs(
                     vae,
                     audio_vae,
                     resolved_width,
                     resolved_height,
                     str(ref_image_size),
-                    refs,
-                    ref_videos=ref_videos,
-                    ref_video_fps=ref_video_fps,
-                    ref_video_audios=ref_video_audios,
+                    clip_refs,
+                    ref_videos=clip_ref_videos,
+                    ref_video_fps=clip_ref_video_fps,
+                    ref_video_audios=clip_ref_video_audios,
                     standalone_audio_count=0,
                     frame_count=frame_count,
-                    cached_image_blocks=prepared_image_blocks,
-                    cached_video_blocks=cached_video_blocks,
                 )
-                image_block_count = len(active_picture_slots or [])
-                if prepared_image_blocks is None:
-                    prepared_image_blocks = list((ref_blocks or [])[:image_block_count])
-                if active_ref_video_count:
-                    # Refresh insertion order on a cache hit: this is a real
-                    # two-entry LRU, not just a FIFO. The common 5s/10s/5s
-                    # pattern therefore keeps both useful duration blocks.
-                    duration_key = int(frame_count)
-                    prepared_video_blocks_by_frame_count.pop(duration_key, None)
-                    prepared_video_blocks_by_frame_count[duration_key] = list((ref_blocks or [])[image_block_count:])
-                    while len(prepared_video_blocks_by_frame_count) > 2:
-                        oldest_key = next(iter(prepared_video_blocks_by_frame_count))
-                        prepared_video_blocks_by_frame_count.pop(oldest_key, None)
-                prepared_ref_frame_count = frame_count
+            else:
+                needs_ref_prepare = (
+                    ref_items is None
+                    or ref_blocks is None
+                    or active_picture_slots is None
+                    or active_video_slots is None
+                    or (active_ref_video_count and prepared_ref_frame_count != frame_count)
+                )
+                if needs_ref_prepare:
+                    cached_video_blocks = prepared_video_blocks_by_frame_count.get(int(frame_count))
+                    ref_items, ref_blocks, active_picture_slots, active_video_slots = _prepare_shared_refs(
+                        vae,
+                        audio_vae,
+                        resolved_width,
+                        resolved_height,
+                        str(ref_image_size),
+                        refs,
+                        ref_videos=ref_videos,
+                        ref_video_fps=ref_video_fps,
+                        ref_video_audios=ref_video_audios,
+                        standalone_audio_count=0,
+                        frame_count=frame_count,
+                        cached_image_blocks=prepared_image_blocks,
+                        cached_video_blocks=cached_video_blocks,
+                    )
+                    image_block_count = len(active_picture_slots or [])
+                    if prepared_image_blocks is None:
+                        prepared_image_blocks = list((ref_blocks or [])[:image_block_count])
+                    if active_ref_video_count:
+                        duration_key = int(frame_count)
+                        prepared_video_blocks_by_frame_count.pop(duration_key, None)
+                        prepared_video_blocks_by_frame_count[duration_key] = list((ref_blocks or [])[image_block_count:])
+                        while len(prepared_video_blocks_by_frame_count) > 2:
+                            oldest_key = next(iter(prepared_video_blocks_by_frame_count))
+                            prepared_video_blocks_by_frame_count.pop(oldest_key, None)
+                    prepared_ref_frame_count = frame_count
+                clip_base_items = ref_items or []
+                clip_base_blocks = ref_blocks or []
+                clip_picture_slots = active_picture_slots or []
+                clip_video_slots = active_video_slots or []
 
-            clip_ref_items = list(ref_items or [])
-            clip_ref_blocks = list(ref_blocks or [])
-            # Paired video soundtracks are already packed before standalone Audio
-            # refs and therefore consume the first native <Audio N> ordinals.
+            clip_ref_items = list(clip_base_items or [])
+            clip_ref_blocks = list(clip_base_blocks or [])
             audio_native_offset = sum(
                 1
-                for item in (ref_items or [])
+                for item in (clip_base_items or [])
                 if isinstance(item, dict) and item.get("type") == "audio"
             )
             if selected_ref_audio_count:
-                if (_reference_count(refs) + active_ref_video_count) < 1:
+                if (_reference_count(clip_refs) + active_clip_video_count) < 1:
                     raise ValueError(
                         "MiniMax H3 Extender: standalone reference audio requires at least one image or video reference."
                     )
-                audio_items, audio_blocks = _prepare_standalone_audio_refs(
+                audio_items, audio_blocks, selected_audio_slots = _prepare_standalone_audio_refs(
                     audio_vae,
                     selected_ref_audios,
                     selected_audio_offsets,
@@ -4146,8 +5391,8 @@ class MiniMaxH3Extender:
                 frame_count,
                 clip_ref_items,
                 clip_ref_blocks,
-                active_picture_slots,
-                active_video_slots,
+                clip_picture_slots,
+                clip_video_slots,
                 active_audio_slots=selected_audio_slots,
                 audio_native_offset=audio_native_offset,
             )
@@ -4200,11 +5445,30 @@ class MiniMaxH3Extender:
                 fps=float(FPS),
                 previous_cache=previous_handle,
                 unique_id=f"extender_{owner}",
+                computed=(str(run_mode) == "full_batch"),
             )
             previous_handle = result[0]
             previous_proxy = result[1]
             statuses.append(result[4])
             generated.append(i)
+
+            # The sampled latent is safely on disk. Release generation tensors
+            # before VideoVAE is staged, then create the same decoded segment
+            # cache used by Clip-by-Clip. This turns every completed Full-Batch
+            # clip into a real resumable checkpoint rather than postponing one
+            # giant decode pass until the end.
+            del sampled, positive, latent, clip_model, clip_text_encoder
+
+            if str(run_mode) == "full_batch":
+                _send_extender_progress(
+                    owner, i, len(clips), "sampling",
+                    f"Caching Ref2VA clip {i + 1}/{len(clips)}",
+                )
+                cache_full_batch_ref2va_segment(
+                    data_path, manifest_path, i, vae, audio_vae, float(FPS),
+                    export_profile=active_export_profile,
+                    color_adjustment=cfg.get("color_adjustment"),
+                )
 
             _send_extender_progress(
                 owner,
@@ -4214,10 +5478,13 @@ class MiniMaxH3Extender:
                 f"Clip {i + 1}/{len(clips)} complete",
             )
 
-            # Drop full sampled/conditioning and card-local patched MODEL/CLIP
-            # references before the next clip. The incoming base model remains
-            # untouched, so a LoRA selected on one card cannot leak to another.
-            del sampled, positive, latent, clip_model, clip_text_encoder
+            if (
+                str(run_mode) == "full_batch"
+                and full_batch_interrupt_requested(owner, "ref2va", consume=True)
+            ):
+                interrupted = True
+                interrupted_after = i + 1
+                break
 
             if str(run_mode) == "clip_by_clip":
                 break
@@ -4230,6 +5497,35 @@ class MiniMaxH3Extender:
             raise RuntimeError("MiniMax H3 Extender: sequence produced no cache handle.")
 
         final_manifest = _load_manifest_from_paths(data_path, manifest_path)
+        if str(run_mode) == "full_batch" and final_manifest is not None:
+            if interrupted:
+                final_manifest = _interrupt_batch_checkpoint(
+                    manifest_path,
+                    final_manifest,
+                    interrupted_after,
+                    len(clips),
+                )
+                previous_handle = dict(previous_handle)
+                previous_handle["interrupted"] = True
+                previous_handle["snapshot_count"] = int(interrupted_after)
+                previous_handle["project_total_clips"] = int(len(clips))
+                previous_handle["status"] = f"interrupted after clip {int(interrupted_after)}"
+            else:
+                final_manifest = _finish_batch_checkpoint(manifest_path, final_manifest)
+
+        # Persist the causal clip-id order as metadata only. This does not alter
+        # Motion Context execution; it lets the frontend detect a timeline edit
+        # made while independent Ref2VA was active and avoid restoring an old
+        # positional validation onto a newly inserted card.
+        if final_manifest is not None:
+            causal_cached_count = len(final_manifest.get("segments", []))
+            wanted_lineage = [str(cfg.get("id") or f"clip_{idx + 1}") for idx, cfg in enumerate(clips[:causal_cached_count])]
+            if list(final_manifest.get("extender_clip_ids") or []) != wanted_lineage:
+                final_manifest = dict(final_manifest)
+                final_manifest["extender_clip_ids"] = wanted_lineage
+                final_manifest["updated_at"] = time.time()
+                _write_json_atomic(manifest_path, final_manifest)
+
         # Color grading is montage metadata only. Keep it attached to each cached
         # decoded segment without invalidating latents or validation state.
         if final_manifest is not None:
@@ -4241,6 +5537,7 @@ class MiniMaxH3Extender:
                 wanted = _normalize_color_adjustment(clips[color_i].get("color_adjustment"))
                 if desc.get("color_adjustment") != wanted:
                     desc["color_adjustment"] = wanted
+                    desc["final_video_dirty"] = True
                     color_segments[color_i] = desc
                     color_changed = True
             if color_changed:
@@ -4257,8 +5554,9 @@ class MiniMaxH3Extender:
                 validated_count += 1
             else:
                 break
+        computed_indices = _ref2va_computed_indices(final_manifest)
 
-        normalized_json = _state_json(clips, active_prompt_pack_signature, generation_mode)
+        normalized_json = _state_json(clips, active_prompt_pack_signature, generation_mode, motion_context=True)
         if resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
             resolution_text = (
                 f"{resolved_width}x{resolved_height} from ref_{int(resolution['guide_ref'])} "
@@ -4283,11 +5581,16 @@ class MiniMaxH3Extender:
         ref_pack_text = ""
         if external_ref_pack is not None:
             connected_ref_count = int(external_ref_pack.get("count", 0) or 0)
+            details = []
             if ref_pack_imported_slots:
                 imported_text = ",".join(str(i) for i in ref_pack_imported_slots)
-                ref_pack_text = f" | ref pack {connected_ref_count} linked, imported Ref {imported_text}"
-            else:
-                ref_pack_text = f" | ref pack {connected_ref_count} linked"
+                details.append(f"imported Ref {imported_text}")
+            if ref_pack_skipped_slots:
+                skipped_text = ",".join(str(i) for i in ref_pack_skipped_slots)
+                details.append(f"ignored local-reserved Ref {skipped_text}")
+            ref_pack_text = f" | ref pack {connected_ref_count} linked"
+            if details:
+                ref_pack_text += ", " + "; ".join(details)
         status = (
             f"{str(run_mode)} | {resolution_text} | refs {_reference_count(refs)} | video refs {active_ref_video_count}"
             f" | video audios {active_ref_video_audio_count} | audio refs {active_ref_audio_count} | cached {cached_count}/{len(clips)} | "
@@ -4298,6 +5601,8 @@ class MiniMaxH3Extender:
                 else "disk only"
             )
         )
+        if interrupted:
+            status += f" | INTERRUPTED after clip {int(interrupted_after)} | checkpoint saved"
         cache_mb = _cache_size_mb(data_path, manifest_path)
 
         _send_extender_progress(
@@ -4314,6 +5619,13 @@ class MiniMaxH3Extender:
             "clip_count": len(clips),
             "cached_count": cached_count,
             "validated_count": validated_count,
+            "cached_clip_ids": [str(x) for x in list((final_manifest or {}).get("extender_clip_ids") or [])[:cached_count] if str(x)],
+            "validated_clip_ids": [str(x) for x in list((final_manifest or {}).get("extender_clip_ids") or [])[:validated_count] if str(x)],
+            "computed_indices": computed_indices,
+            "computed_clip_ids": [],
+            "checkpoint_active": bool(interrupted),
+            "checkpoint_interrupted": bool(interrupted),
+            "checkpoint_snapshot_count": int(interrupted_after if interrupted else 0),
             "generated": [i + 1 for i in generated],
             "status": status,
             "resolved_width": resolved_width,
@@ -4348,6 +5660,7 @@ class MiniMaxH3Extender:
             "ref_pack_connected": external_ref_pack is not None,
             "ref_pack_count": int(external_ref_pack.get("count", 0) or 0) if external_ref_pack is not None else 0,
             "ref_pack_imported_slots": [int(i) for i in ref_pack_imported_slots],
+            "ref_pack_skipped_slots": [int(i) for i in ref_pack_skipped_slots],
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "build": BUILD,
         }
@@ -4432,6 +5745,86 @@ if getattr(PromptServer, "instance", None) is not None:
             except Exception as exc:
                 return web.json_response({"ok": False, "error": str(exc)}, status=400)
             return web.json_response({"ok": True, "ref": ref})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    @PromptServer.instance.routes.get("/h3_extender/local_media/{media_id}")
+    async def h3_extender_local_media_preview(request):
+        """Serve one internal clip-local media ref inline for the Refs dialog player."""
+        try:
+            media_id = str(request.match_info.get("media_id") or "").lower().strip()
+            if not _ref_id_is_safe(media_id):
+                return web.json_response({"ok": False, "error": "Invalid local media reference id."}, status=400)
+            path = _local_media_path(media_id)
+            if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+                return web.json_response({"ok": False, "error": "Local media reference not found."}, status=404)
+
+            kind = str(request.query.get("kind") or "").lower().strip()
+            original_name = str(request.query.get("name") or "")
+            guessed_type, _ = mimetypes.guess_type(original_name)
+            if kind == "video" and (not guessed_type or not guessed_type.startswith("video/")):
+                guessed_type = "video/mp4"
+            elif kind == "audio" and (not guessed_type or not guessed_type.startswith("audio/")):
+                guessed_type = "audio/mpeg"
+            elif not guessed_type:
+                guessed_type = "application/octet-stream"
+
+            response = web.FileResponse(path)
+            response.content_type = guessed_type
+            response.headers["Content-Disposition"] = "inline"
+            response.headers["Cache-Control"] = "private, max-age=3600"
+            return response
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/h3_extender/local_media/upload")
+    async def h3_extender_local_media_upload(request):
+        """Upload one clip-local video/audio reference into the internal media store."""
+        temp_path = _project_temp_root() / f"local_media_upload_{uuid.uuid4().hex}.bin"
+        original_name = "local_ref.bin"
+        kind = ""
+        got_file = False
+        size = 0
+        try:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == "kind":
+                    kind = (await part.text()).strip().lower()
+                    continue
+                if part.name != "media_file":
+                    continue
+                original_name = str(part.filename or "local_ref.bin")
+                with open(temp_path, "wb") as f:
+                    while True:
+                        chunk = await part.read_chunk(size=PROJECT_COPY_CHUNK)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_LOCAL_MEDIA_UPLOAD_BYTES:
+                            raise ValueError(
+                                f"MiniMax H3 Extender: local media upload exceeds {MAX_LOCAL_MEDIA_UPLOAD_BYTES // (1024 * 1024)} MB."
+                            )
+                        f.write(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+                got_file = True
+            if kind not in {"video", "audio"}:
+                return web.json_response({"ok": False, "error": "Local media kind must be video or audio."}, status=400)
+            if not got_file or not temp_path.exists() or temp_path.stat().st_size <= 0:
+                return web.json_response({"ok": False, "error": "No local media file was uploaded."}, status=400)
+            try:
+                media = await asyncio.to_thread(_store_uploaded_media, temp_path, original_name, kind)
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            return web.json_response({"ok": True, "media": media})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         finally:

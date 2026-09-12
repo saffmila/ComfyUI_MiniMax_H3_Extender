@@ -121,5 +121,47 @@ def apply_patch():
     return True
 
 
+def ensure_patch():
+    """Reassert this exact patch if another extension replaced it.
+
+    Unlike apply_patch(), this does not trust third-party compatibility
+    markers.  The payload transformation remains the v2.6.0 implementation;
+    only ownership is enforced here immediately before Extender execution.
+    """
+    global _orig_extra_conds, _applied
+
+    cls = getattr(model_base, "MiniMaxH3", None)
+    if cls is None or not hasattr(cls, "extra_conds"):
+        _LOG.warning(
+            "MiniMax H3 Motion Context RAM: MiniMaxH3.extra_conds not found."
+        )
+        return False
+
+    current = cls.extra_conds
+    if current is _patched_extra_conds:
+        _applied = True
+        return True
+
+    # Capture the live implementation only on our first real installation.
+    # If our patch was installed previously and later overwritten, keep the
+    # original function we already wrapped; this avoids stacking/recursion and
+    # simply restores our known-good v2.6.0 patch.
+    if _orig_extra_conds is None:
+        _orig_extra_conds = current
+
+    cls.extra_conds = _patched_extra_conds
+    _applied = True
+
+    where = getattr(current, "__module__", "?")
+    name = getattr(current, "__name__", type(current).__name__)
+    _LOG.info(
+        "MiniMax H3 Motion Context RAM: reasserted Extender payload patch "
+        "over %s.%s",
+        where,
+        name,
+    )
+    return True
+
+
 def is_applied():
     return _applied
