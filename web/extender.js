@@ -5367,8 +5367,12 @@ function render(node, runtime) {
         foot.style.marginTop = "9px";
         foot.style.gap = "8px";
 
+        // Outside the branch: foot.append below needs either control in scope.
+        let validateLabel = null;
+        let validationRow = null;
+
         if (fl2vaMode || randomAccess) {
-                    const validateLabel = document.createElement("label");
+                    validateLabel = document.createElement("label");
                     validateLabel.style.display = "flex";
                     validateLabel.style.alignItems = "center";
                     validateLabel.style.gap = "6px";
@@ -5549,7 +5553,7 @@ function render(node, runtime) {
                     });
                     validateLabel.append(validated, document.createTextNode("Validated"));
         } else {
-                    const validationRow = document.createElement("div");
+                    validationRow = document.createElement("div");
                     validationRow.style.display = "flex";
                     validationRow.style.alignItems = "center";
                     validationRow.style.gap = "8px";
