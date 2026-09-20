@@ -5596,12 +5596,10 @@ class MiniMaxH3MotionContextDiskFinalDecode:
     @classmethod
     def INPUT_TYPES(cls):
         try:
-            from .latent_upscaler import default_upscale_model, scan_upscale_models
+            from .latent_upscaler import scan_upscale_models
             upscale_models = scan_upscale_models()
-            _default_upscale = default_upscale_model(upscale_models)
         except Exception:
             upscale_models = ["None"]
-            _default_upscale = "None"
         try:
             from .stitch_bridge import default_rife_ckpt, rife_ckpt_choices
 
@@ -5635,7 +5633,10 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], {"default": "fast"}),
                 "audio_bitrate": (["128k", "192k", "256k", "320k"], {"default": "192k"}),
                 "autoplay": ("BOOLEAN", {"default": True, "tooltip": "Auto-play the video preview when generating finishes or the node is loaded."}),
-                # Appended so old positional workflow widget arrays keep mapping.
+                "auto_save_project": ("BOOLEAN", {"default": False, "tooltip": "Save a portable .ext project beside each completed Full Batch video. All three modes supported. Ignored in Clip-by-Clip and for interrupted batches. Large projects add disk space and saving time."}),
+                "save_individual_clips": ("BOOLEAN", {"default": False, "tooltip": "Full Batch only. Export each final user-visible clip beside the assembled video, with final video treatment and audio. Disabled leaves the existing export path unchanged."}),
+                # Appended after upstream widgets so old positional widgets_values
+                # keep mapping autoplay -> autosave -> individual clips.
                 "latent_layer": (
                     ["auto", "draft", "refine"],
                     {
@@ -5646,8 +5647,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "latent_upscale_model": (
                     upscale_models,
                     {
-                        "default": _default_upscale,
-                        "tooltip": "Optional neural upscale of video latents right before VAE decode. Audio untouched. Skipped automatically when decoding refine.",
+                        "default": "None",
+                        "tooltip": "Optional neural upscale of video latents right before VAE decode. Audio untouched. Skipped automatically when decoding refine. Default None — enable explicitly.",
                     },
                 ),
                 "latent_upscale_megapixels": (
@@ -5664,8 +5665,6 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     ["fp16", "bf16", "fp32"],
                     {"default": "bf16"},
                 ),
-                "auto_save_project": ("BOOLEAN", {"default": False, "tooltip": "Save a portable .ext project beside each completed Full Batch video. All three modes supported. Ignored in Clip-by-Clip and for interrupted batches. Large projects add disk space and saving time."}),
-                "save_individual_clips": ("BOOLEAN", {"default": False, "tooltip": "Full Batch only. Export each final user-visible clip beside the assembled video, with final video treatment and audio. Disabled leaves the existing export path unchanged."}),
             },
             "optional": {
                 # Optional Instagram / source clip for SeamlessVideoStitcher.
@@ -5783,6 +5782,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         preset,
         audio_bitrate,
         autoplay=True,
+        auto_save_project=False,
+        save_individual_clips=False,
         latent_layer="auto",
         latent_upscale_model="None",
         latent_upscale_megapixels=1.2,
@@ -5798,8 +5799,6 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         unique_id=None,
         prompt=None,
         extra_pnginfo=None,
-        auto_save_project=False,
-        save_individual_clips=False,
     ):
         global _ACTIVE_UPSCALE_CTX
         if str(latent_layer or "").strip() == "":

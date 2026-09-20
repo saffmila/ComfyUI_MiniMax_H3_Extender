@@ -64,6 +64,8 @@ from .motion_context_disk import (
     _chain_paths,
     _clear_refine_sidecar,
     _invalidate_refine_from_index,
+    _refine_paths_from_draft,
+    _refine_sidecar_media_paths,
     _decoded_audio_cache_path,
     _decoded_audio_cache_end,
     _decoded_preview_cache_path,
@@ -143,7 +145,7 @@ REF_AUDIO_TIMELINE_SPLIT_SECONDS = 5.0
 MAX_CLIPS = 512
 MAX_FL2VA_GUIDES = 3
 DEFAULT_DURATION = 10.0
-DEFAULT_MEGAPIXELS = 0.70
+DEFAULT_MEGAPIXELS = 0.40
 MAX_RESOLUTION = 4096
 DEFAULT_SEED_MAX = (1 << 53) - 1  # exact integer range in browser JS
 
@@ -2910,6 +2912,67 @@ def _project_cache_snapshot(owner_id, project_payload):
     else:
         manifest.pop("preview_portable_full", None)
 
+    # Optional refine sidecar (*.refine.h3cache / *.refine.json). Keep draft and
+    # refine independent: missing refine is fine; a corrupt pair is skipped with
+    # a warning so Save Project still packages the draft chain.
+    refine_snapshot = None
+    refine_data_path, refine_manifest_path = _refine_paths_from_draft(data_path)
+    if refine_data_path.exists() and refine_manifest_path.exists():
+        try:
+            refine_manifest = _load_manifest_from_paths(refine_data_path, refine_manifest_path)
+            if refine_manifest is not None:
+                refine_manifest = copy.deepcopy(refine_manifest)
+                refine_segments = [dict(x) for x in refine_manifest.get("segments", [])]
+                if not random_access:
+                    # Causal refine: align prefix with draft snapshot length and
+                    # persist refine_validated from the UI card state.
+                    refine_segments = refine_segments[: len(segments)]
+                    for i, desc in enumerate(refine_segments):
+                        desc["validated"] = bool(
+                            i < len(clips) and clips[i].get("refine_validated", False)
+                        )
+                    refine_manifest["segments"] = refine_segments
+                    refine_manifest["final_frame_count"] = _final_frame_count(refine_segments)
+                if refine_segments:
+                    refine_data_limit = max(
+                        int(x.get("segment_end", 0) or 0) for x in refine_segments
+                    )
+                else:
+                    refine_data_limit = int(_DATA_START)
+                if refine_data_limit < int(_DATA_START):
+                    raise ValueError("invalid refine cache byte boundary")
+                if int(refine_data_path.stat().st_size) < refine_data_limit:
+                    raise IOError("refine cache changed while snapshotting")
+                refine_audio_path = _decoded_audio_cache_path(refine_data_path)
+                refine_audio_limit = _decoded_audio_cache_end(refine_segments)
+                refine_has_audio = any(
+                    isinstance(desc.get("decoded_audio"), dict)
+                    and desc["decoded_audio"].get("storage") == "audio_cache"
+                    for desc in refine_segments
+                )
+                if refine_has_audio:
+                    if not refine_audio_path.exists():
+                        raise FileNotFoundError("refine decoded audio cache is missing")
+                    if int(refine_audio_path.stat().st_size) < int(refine_audio_limit):
+                        raise IOError("refine decoded audio cache changed while snapshotting")
+                else:
+                    refine_audio_limit = 0
+                refine_preview_path = _decoded_preview_cache_path(refine_data_path)
+                refine_snapshot = {
+                    "data_path": refine_data_path,
+                    "manifest_path": refine_manifest_path,
+                    "audio_path": refine_audio_path,
+                    "preview_path": refine_preview_path,
+                    "manifest": refine_manifest,
+                    "data_limit": int(refine_data_limit),
+                    "audio_limit": int(refine_audio_limit),
+                }
+        except Exception as exc:
+            print(
+                f"[WARNING] MiniMax H3 Extender: refine sidecar skipped in project archive: {exc}"
+            )
+            refine_snapshot = None
+
     return {
         "data_path": data_path,
         "manifest_path": manifest_path,
@@ -2919,6 +2982,7 @@ def _project_cache_snapshot(owner_id, project_payload):
         "manifest": manifest,
         "data_limit": data_limit,
         "audio_limit": int(audio_limit),
+        "refine": refine_snapshot,
     }
 
 
@@ -3174,6 +3238,10 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "has_committed_preview": bool(snapshot and snapshot["preview_path"].exists()),
             "has_portable_full_preview": bool(snapshot and snapshot.get("preview_is_full", False)),
             "has_decoded_audio_cache": bool(snapshot and int(snapshot.get("audio_limit", 0)) > 0),
+            "has_refine_cache": bool(snapshot and isinstance(snapshot.get("refine"), dict)),
+            "refine_clip_count": int(
+                len((snapshot.get("refine") or {}).get("manifest", {}).get("segments", []))
+            ) if snapshot and isinstance(snapshot.get("refine"), dict) else 0,
             "final_video_files": [
                 f"cache/final_video/{path.name}" for path in final_video_files
             ],
@@ -3281,6 +3349,37 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                     arcname="cache/chain.preview.mp4",
                     compress_type=zipfile.ZIP_STORED,
                 )
+            refine = snapshot.get("refine")
+            if isinstance(refine, dict) and refine.get("data_path") and refine.get("manifest"):
+                refine_manifest_bytes = json.dumps(
+                    refine["manifest"],
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8")
+                zf.writestr(
+                    "cache/chain.refine.json",
+                    refine_manifest_bytes,
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+                _zip_write_prefix(
+                    zf,
+                    "cache/chain.refine.h3cache",
+                    refine["data_path"],
+                    refine["data_limit"],
+                )
+                if int(refine.get("audio_limit", 0)) > 0:
+                    _zip_write_prefix(
+                        zf,
+                        "cache/chain.refine.audio.h3cache",
+                        refine["audio_path"],
+                        refine["audio_limit"],
+                    )
+                if Path(refine.get("preview_path") or "").exists():
+                    zf.write(
+                        refine["preview_path"],
+                        arcname="cache/chain.refine.preview.mp4",
+                        compress_type=zipfile.ZIP_STORED,
+                    )
     return archive_meta
 
 def _safe_zip_member(name):
@@ -3313,6 +3412,10 @@ def _replace_cache_transaction(
     new_preview=None,
     new_audio=None,
     new_final_video_dir=None,
+    new_refine_data=None,
+    new_refine_manifest=None,
+    new_refine_preview=None,
+    new_refine_audio=None,
     generation_mode="ref2va",
     motion_context=True,
 ):
@@ -3323,6 +3426,10 @@ def _replace_cache_transaction(
     target_preview = _decoded_preview_cache_path(target_data)
     target_preview_video = _decoded_preview_video_cache_path(target_data)
     target_audio = _decoded_audio_cache_path(target_data)
+    target_refine_data, target_refine_manifest = _refine_paths_from_draft(target_data)
+    target_refine_preview, target_refine_preview_video, target_refine_audio = (
+        _refine_sidecar_media_paths(target_refine_data)
+    )
     target_fl2va_video_dir = target_data.with_suffix(".fl2va.video")
     target_ref2va_final_video_dir = target_data.with_suffix(".final.video")
     target_final_video_dir = (
@@ -3330,8 +3437,20 @@ def _replace_cache_transaction(
     )
     # The video-only preview prefix is derived and is intentionally not stored
     # in .ext. The decoded-audio cache is primary cache data and is restored
-    # together with the latent chain when present.
-    targets = [target_data, target_manifest, target_preview, target_preview_video, target_audio]
+    # together with the latent chain when present. Refine sidecars follow the
+    # same transactional backup/replace rules as the draft chain.
+    targets = [
+        target_data,
+        target_manifest,
+        target_preview,
+        target_preview_video,
+        target_audio,
+        target_refine_data,
+        target_refine_manifest,
+        target_refine_preview,
+        target_refine_preview_video,
+        target_refine_audio,
+    ]
     backups = []
     token = uuid.uuid4().hex[:10]
 
@@ -3363,8 +3482,16 @@ def _replace_cache_transaction(
                 for source in Path(new_final_video_dir).iterdir():
                     if source.is_file():
                         os.replace(str(source), target_final_video_dir / source.name)
+            if new_refine_data is not None and new_refine_manifest is not None:
+                os.replace(str(new_refine_data), target_refine_data)
+                os.replace(str(new_refine_manifest), target_refine_manifest)
+                if new_refine_preview is not None and Path(new_refine_preview).exists():
+                    os.replace(str(new_refine_preview), target_refine_preview)
+                if new_refine_audio is not None and Path(new_refine_audio).exists():
+                    os.replace(str(new_refine_audio), target_refine_audio)
         # No imported cache means an intentionally empty project. The old cache
-        # remains only in backups until this transaction succeeds.
+        # remains only in backups until this transaction succeeds. Missing refine
+        # in an otherwise valid draft import also leaves refine targets deleted.
     except Exception:
         for target in targets:
             try:
@@ -3396,6 +3523,10 @@ def _import_project_archive(owner_id, archive_path):
     new_manifest = work_root / "chain.json"
     new_audio = work_root / "chain.audio.h3cache"
     new_preview = work_root / "chain.preview.mp4"
+    new_refine_data = work_root / "chain.refine.h3cache"
+    new_refine_manifest = work_root / "chain.refine.json"
+    new_refine_audio = work_root / "chain.refine.audio.h3cache"
+    new_refine_preview = work_root / "chain.refine.preview.mp4"
     new_final_video_dir = work_root / "final_video"
     continuity_restore = []
 
@@ -3658,6 +3789,24 @@ def _import_project_archive(owner_id, archive_path):
                 if "cache/chain.preview.mp4" in names:
                     _zip_copy_member(zf, "cache/chain.preview.mp4", new_preview)
 
+                has_refine_data = "cache/chain.refine.h3cache" in names
+                has_refine_manifest = "cache/chain.refine.json" in names
+                if has_refine_data != has_refine_manifest:
+                    raise ValueError(
+                        "MiniMax H3 Extender Project: incomplete refine cache payload."
+                    )
+                if has_refine_data:
+                    _zip_copy_member(zf, "cache/chain.refine.h3cache", new_refine_data)
+                    _zip_copy_member(zf, "cache/chain.refine.json", new_refine_manifest)
+                    if "cache/chain.refine.audio.h3cache" in names:
+                        _zip_copy_member(
+                            zf, "cache/chain.refine.audio.h3cache", new_refine_audio
+                        )
+                    if "cache/chain.refine.preview.mp4" in names:
+                        _zip_copy_member(
+                            zf, "cache/chain.refine.preview.mp4", new_refine_preview
+                        )
+
                 final_members = sorted(
                     name for name in names
                     if name.startswith("cache/final_video/") and not name.endswith("/")
@@ -3843,6 +3992,26 @@ def _import_project_archive(owner_id, archive_path):
                 new_final_video_dir=(
                     new_final_video_dir
                     if imported_manifest is not None and new_final_video_dir.exists()
+                    else None
+                ),
+                new_refine_data=(
+                    new_refine_data
+                    if imported_manifest is not None and new_refine_data.exists() and new_refine_manifest.exists()
+                    else None
+                ),
+                new_refine_manifest=(
+                    new_refine_manifest
+                    if imported_manifest is not None and new_refine_data.exists() and new_refine_manifest.exists()
+                    else None
+                ),
+                new_refine_preview=(
+                    new_refine_preview
+                    if imported_manifest is not None and new_refine_preview.exists()
+                    else None
+                ),
+                new_refine_audio=(
+                    new_refine_audio
+                    if imported_manifest is not None and new_refine_audio.exists()
                     else None
                 ),
                 generation_mode=generation_mode,

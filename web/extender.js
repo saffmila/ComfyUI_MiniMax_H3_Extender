@@ -34,7 +34,7 @@ const MAX_IMAGE_REFS = 9;
 const MAX_MIXED_REFS = 12;
 const MAX_FL2VA_GUIDES = 3;
 const MAX_RESOLUTION = 4096;
-const DEFAULT_MEGAPIXELS = 0.70;
+const DEFAULT_MEGAPIXELS = 0.40;
 
 // Nodes 2.0 lifecycle guard. Workflow loading is bracketed by the official
 // beforeConfigureGraph/afterConfigureGraph extension hooks; while this flag is

@@ -159,12 +159,8 @@ function ensureLatentUpscaleWidgetDefaults(node) {
     }
     const model = getWidget(node, "latent_upscale_model");
     if (model && (model.value === "" || model.value == null)) {
-        // Prefer bf16 H3 weights when present; else first real checkpoint.
-        const opts = model.options || model.values || [];
-        const list = Array.isArray(opts) ? opts : [];
-        const bf16 = list.find((v) => v && v !== "None" && String(v).toLowerCase().includes("bf16"));
-        const any = list.find((v) => v && v !== "None");
-        model.value = bf16 || any || "None";
+        // Explicit opt-in: never auto-pick installed weights on Final Decode.
+        model.value = "None";
     }
     const precision = getWidget(node, "latent_upscale_precision");
     if (precision && (precision.value === "" || precision.value == null)) {
