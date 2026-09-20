@@ -9,7 +9,8 @@ validated disk cache and the separate Final Decode / Preview node.
 The node intentionally accepts an already-patched H3 MODEL. Sigma-shift,
 upstream LoRA, Spectrum or other model patches therefore compose normally
 before the Extender; optional card-local LoRAs can be stacked on top per clip.
-Optional Alibaba PDD Acc uses ComfyUI-MiniMax-H3-PDD-Acc when selected.
+Optional Alibaba PDD Acc: patch via MiniMaxH3PDDAccApply upstream and connect
+its SIGMAS output to the Extender's optional sigmas input.
 """
 
 from __future__ import annotations
@@ -52,11 +53,6 @@ from server import PromptServer
 from .motion_context_ram import MiniMaxH3MotionContextRAM
 from .prompt_bridge import MAX_PROMPTS, PROMPT_PACK_TYPE, _prompt_pack_signature
 from .reference_bridge import MAX_REFERENCE_SLOTS, REF_PACK_TYPE
-from .pdd_bridge import (
-    apply_pdd_acc,
-    is_pdd_enabled,
-    pdd_acc_choices,
-)
 from .motion_context_disk import (
     CACHE_VERSION,
     CACHE_TYPE,
@@ -1876,6 +1872,109 @@ def _sigmas(model, scheduler: str, steps: int, denoise: float):
     return sigmas[-(steps + 1):]
 
 
+def _trim_sigmas_by_denoise(sigmas, denoise: float):
+    """Keep the last round(nfe * denoise) sigma blocks (PDD Acc Scheduler style)."""
+    denoise = float(denoise)
+    if sigmas is None:
+        return None
+    if denoise >= 1.0:
+        return sigmas
+    if denoise <= 0.0:
+        return torch.FloatTensor([])
+    nfe = max(1, int(sigmas.shape[-1]) - 1)
+    keep = max(1, int(round(nfe * denoise)))
+    return sigmas[-(keep + 1) :]
+
+
+def _coerce_external_sigmas(sigmas):
+    """Normalize an optional ComfyUI SIGMAS input; None when disconnected."""
+    if sigmas is None:
+        return None
+    if not torch.is_tensor(sigmas):
+        raise ValueError(
+            "MiniMax H3 Extender: optional sigmas input must be a SIGMAS tensor "
+            "(e.g. from MiniMaxH3PDDAccApply)."
+        )
+    if int(sigmas.numel()) < 2:
+        raise ValueError(
+            "MiniMax H3 Extender: optional sigmas input is empty. Disconnect it "
+            "to use steps/scheduler, or connect a valid SIGMAS output."
+        )
+    return sigmas
+
+
+def _resolve_sample_sigmas(external_sigmas, denoise: float):
+    """Return denoise-trimmed external sigmas, or None to use steps/scheduler."""
+    coerced = _coerce_external_sigmas(external_sigmas)
+    if coerced is None:
+        return None
+    return _trim_sigmas_by_denoise(coerced, denoise)
+
+
+def _coerce_extender_refine_widgets(
+    latent_upscale_model,
+    refine_megapixels,
+    refine_denoise,
+    refine_steps,
+    latent_upscale_precision,
+):
+    """Repair refine widgets after removal of internal PDD Acc fields.
+
+    Old workflows still serialize ``pdd_acc_lora/pdd_nfe/...`` in widgets_values.
+    Positional restore then maps ``pdd_nfe='8'`` onto ``latent_upscale_model`` and
+    the real model name onto ``latent_upscale_precision``.
+    """
+    model = str(latent_upscale_model or "").strip()
+    precision = str(latent_upscale_precision or "").strip()
+
+    try:
+        from .latent_upscaler import scan_upscale_models
+
+        allowed_models = set(scan_upscale_models())
+    except Exception:
+        allowed_models = {"None"}
+    if model not in allowed_models:
+        if model:
+            logging.warning(
+                "MiniMax H3 Extender: coerced latent_upscale_model %r -> 'None' "
+                "(legacy PDD widgets_values shift)",
+                latent_upscale_model,
+            )
+        model = "None"
+
+    if precision.lower() not in ("fp16", "bf16", "fp32"):
+        if precision:
+            logging.warning(
+                "MiniMax H3 Extender: coerced latent_upscale_precision %r -> 'bf16' "
+                "(legacy PDD widgets_values shift)",
+                latent_upscale_precision,
+            )
+        precision = "bf16"
+
+    try:
+        mp = float(refine_megapixels)
+    except (TypeError, ValueError):
+        mp = 1.2
+    if not (0.1 <= mp <= 8.0):
+        mp = 1.2
+
+    try:
+        den = float(refine_denoise)
+    except (TypeError, ValueError):
+        den = 0.3
+    if not (0.01 <= den <= 1.0):
+        den = 0.3
+
+    try:
+        steps_i = int(refine_steps)
+    except (TypeError, ValueError):
+        steps_i = 4
+    if steps_i < 1:
+        steps_i = 4
+
+    return model, mp, den, steps_i, precision
+
+
 def _sample_h3(
     model,
     conditioning,
@@ -1893,8 +1992,9 @@ def _sample_h3(
     if sigmas is not None:
         if str(sampler_name).lower() != "euler":
             logging.warning(
-                "MiniMax H3 Extender: PDD Acc is trained for sampler 'euler' "
-                "(current sampler_name=%s). Sampling continues with your choice.",
+                "MiniMax H3 Extender: external SIGMAS (e.g. PDD Acc) are trained "
+                "for sampler 'euler' (current sampler_name=%s). Sampling continues "
+                "with your choice.",
                 sampler_name,
             )
     else:
@@ -1938,39 +2038,6 @@ def _sample_h3(
     out.pop("downscale_ratio_temporal", None)
     out["samples"] = samples
     return out
-
-
-def _prepare_pdd_model(
-    model,
-    *,
-    generation_mode: str,
-    pdd_acc_lora="None",
-    pdd_nfe="8",
-    pdd_lora_strength=1.0,
-    pdd_head_strength=1.0,
-    denoise=1.0,
-    sampler_name="euler",
-):
-    """Return ``(model, sigmas_or_None)``. Sigmas are set only when PDD is on."""
-    if not is_pdd_enabled(pdd_acc_lora):
-        return model, None
-    if str(sampler_name).lower() != "euler":
-        logging.warning(
-            "MiniMax H3 Extender: PDD Acc recipe uses sampler 'euler' "
-            "(sampler_name=%s). Controls are left unchanged; expect quality loss "
-            "if you keep a non-euler sampler.",
-            sampler_name,
-        )
-    patched, sigmas, _info = apply_pdd_acc(
-        model,
-        str(pdd_acc_lora),
-        generation_mode=generation_mode,
-        nfe=pdd_nfe,
-        lora_strength=pdd_lora_strength,
-        head_strength=pdd_head_strength,
-        denoise=denoise,
-    )
-    return patched, sigmas
 
 
 def _normalize_color_adjustment(value=None):
@@ -4331,42 +4398,6 @@ class MiniMaxH3Extender:
                 "BOOLEAN",
                 {"default": True, "tooltip": "Ref2VA only: chain clips with Motion Context. Disable for independent random-access clips."},
             ),
-            # PDD Acc (optional acceleration). Appended after motion_context so
-            # older positional widget arrays keep their original mapping.
-            "pdd_acc_lora": (
-                pdd_acc_choices(),
-                {
-                    "default": "None",
-                    "tooltip": "Optional Alibaba MiniMax-H3 PDD Acc LoRA from models/pdd_acc/. Requires ComfyUI-MiniMax-H3-PDD-Acc. None = normal steps/scheduler. When set, the trained PDD sigma grid is used and steps/scheduler are ignored.",
-                },
-            ),
-            "pdd_nfe": (
-                ["8", "4"],
-                {
-                    "default": "8",
-                    "tooltip": "PDD model evaluations (sampler steps). 8 is the trained default; 4 is the official faster regrouping. Ignored when pdd_acc_lora is None.",
-                },
-            ),
-            "pdd_lora_strength": (
-                "FLOAT",
-                {
-                    "default": 1.0,
-                    "min": -2.0,
-                    "max": 2.0,
-                    "step": 0.01,
-                    "tooltip": "PDD trunk LoRA strength (trained at 1.0). Ignored when pdd_acc_lora is None.",
-                },
-            ),
-            "pdd_head_strength": (
-                "FLOAT",
-                {
-                    "default": 1.0,
-                    "min": 0.0,
-                    "max": 2.0,
-                    "step": 0.01,
-                    "tooltip": "PDD head-bank blend strength (trained at 1.0). Ignored when pdd_acc_lora is None.",
-                },
-            ),
             # Latent refine (appended for workflow widget compatibility).
             "run_refine": (
                 "BOOLEAN",
@@ -4432,6 +4463,12 @@ class MiniMaxH3Extender:
                     "forceInput": True,
                     "lazy": True,
                     "tooltip": "Optional MiniMax H3 FL2VA model. Evaluated only while MODE is FL2VA.",
+                },
+            ),
+            "sigmas": (
+                "SIGMAS",
+                {
+                    "tooltip": "Optional external sigmas (e.g. MiniMaxH3PDDAccApply). When connected, steps/scheduler are ignored. Feed the matching PDD-patched MODEL into model or fl2va_model; you can insert other model nodes between Apply and the Extender.",
                 },
             ),
             "audio_vae": ("VAE", {"forceInput": True}),
@@ -4562,6 +4599,22 @@ class MiniMaxH3Extender:
     OUTPUT_NODE = False
 
     @classmethod
+    def VALIDATE_INPUTS(
+        cls,
+        latent_upscale_model=None,
+        latent_upscale_precision=None,
+        refine_steps=None,
+        refine_megapixels=None,
+        refine_denoise=None,
+        run_refine=None,
+    ):
+        # Old workflows still carry 4 internal PDD Acc widgets in widgets_values.
+        # After those were removed, positional restore shifts refine combos
+        # (e.g. model='8', precision='*.safetensors', steps=0). Accept here and
+        # coerce in extend() / the frontend migrator.
+        return True
+
+    @classmethod
     def check_lazy_status(
         cls,
         generation_mode="ref2va",
@@ -4610,26 +4663,14 @@ class MiniMaxH3Extender:
         resolution_mode,
         megapixels,
         export_profile,
-        pdd_acc_lora="None",
-        pdd_nfe="8",
-        pdd_lora_strength=1.0,
-        pdd_head_strength=1.0,
+        sigmas=None,
     ):
         if fl2va_model is None:
             raise ValueError(
                 "MiniMax H3 Extender: FL2VA mode requires the fl2va_model input."
             )
 
-        fl2va_model, pdd_sigmas = _prepare_pdd_model(
-            fl2va_model,
-            generation_mode="fl2va",
-            pdd_acc_lora=pdd_acc_lora,
-            pdd_nfe=pdd_nfe,
-            pdd_lora_strength=pdd_lora_strength,
-            pdd_head_strength=pdd_head_strength,
-            denoise=denoise,
-            sampler_name=sampler_name,
-        )
+        sample_sigmas = _resolve_sample_sigmas(sigmas, denoise)
 
         clip_ids = [str(cfg.get("id") or f"clip_{i + 1}") for i, cfg in enumerate(clips)]
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
@@ -4916,7 +4957,7 @@ class MiniMaxH3Extender:
             sampled = _sample_h3(
                 clip_model, positive, latent, cfg["seed"],
                 str(sampler_name), str(scheduler), int(steps), float(denoise),
-                sigmas=pdd_sigmas,
+                sigmas=sample_sigmas,
             )
             (
                 previous_handle,
@@ -5152,10 +5193,6 @@ class MiniMaxH3Extender:
         refs_json=None,
         generation_mode="ref2va",
         motion_context=True,
-        pdd_acc_lora="None",
-        pdd_nfe="8",
-        pdd_lora_strength=1.0,
-        pdd_head_strength=1.0,
         run_refine=False,
         latent_upscale_model="None",
         refine_megapixels=1.2,
@@ -5171,6 +5208,21 @@ class MiniMaxH3Extender:
         generation_mode = _normalize_generation_mode(generation_mode)
         motion_context = bool(motion_context)
         run_refine = _coerce_bool(run_refine, False)
+        (
+            latent_upscale_model,
+            refine_megapixels,
+            refine_denoise,
+            refine_steps,
+            latent_upscale_precision,
+        ) = _coerce_extender_refine_widgets(
+            latent_upscale_model,
+            refine_megapixels,
+            refine_denoise,
+            refine_steps,
+            latent_upscale_precision,
+        )
+        external_sigmas = kwargs.get("sigmas")
+        sample_sigmas = _resolve_sample_sigmas(external_sigmas, denoise)
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
         clips = _parse_clips_json(clips_json, generation_mode, motion_context)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
@@ -5218,10 +5270,7 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode,
                 megapixels=megapixels,
                 export_profile=requested_export_profile,
-                pdd_acc_lora=pdd_acc_lora,
-                pdd_nfe=pdd_nfe,
-                pdd_lora_strength=pdd_lora_strength,
-                pdd_head_strength=pdd_head_strength,
+                sigmas=external_sigmas,
             )
 
         if not motion_context:
@@ -5237,10 +5286,7 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode, megapixels=megapixels,
                 refs_json=refs_json, ref_pack=ref_pack,
                 export_profile=requested_export_profile, kwargs=kwargs,
-                pdd_acc_lora=pdd_acc_lora,
-                pdd_nfe=pdd_nfe,
-                pdd_lora_strength=pdd_lora_strength,
-                pdd_head_strength=pdd_head_strength,
+                sigmas=external_sigmas,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -5421,17 +5467,6 @@ class MiniMaxH3Extender:
         prepared_image_blocks = None
         prepared_video_blocks_by_frame_count = {}
 
-        model, pdd_sigmas = _prepare_pdd_model(
-            model,
-            generation_mode=generation_mode,
-            pdd_acc_lora=pdd_acc_lora,
-            pdd_nfe=pdd_nfe,
-            pdd_lora_strength=pdd_lora_strength,
-            pdd_head_strength=pdd_head_strength,
-            denoise=denoise,
-            sampler_name=sampler_name,
-        )
-
         disk_join = MiniMaxH3MotionContextDiskJoin()
         motion = MiniMaxH3MotionContextRAM()
 
@@ -5496,6 +5531,7 @@ class MiniMaxH3Extender:
                 prepare_standalone_audio_refs=_prepare_standalone_audio_refs,
                 apply_per_clip_loras=_apply_per_clip_loras,
                 sample_h3=_sample_h3,
+                sample_sigmas=_resolve_sample_sigmas(external_sigmas, refine_denoise),
                 motion=motion,
                 duration_to_frames=_duration_to_frames,
                 reference_count=_reference_count,
@@ -5872,7 +5908,7 @@ class MiniMaxH3Extender:
                 str(scheduler),
                 int(steps),
                 float(denoise),
-                sigmas=pdd_sigmas,
+                sigmas=sample_sigmas,
             )
 
             result = disk_join.join(

@@ -5758,16 +5758,73 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         latent_upscale_precision=None,
         **_kwargs,
     ):
-        # Old workflows serialize '' for newly appended combos. Accept and let
-        # export() coerce to defaults so legacy graphs keep running.
-        if latent_layer not in (None, "", "auto", "draft", "refine"):
-            return f"latent_layer must be auto/draft/refine, got {latent_layer!r}"
-        if latent_upscale_precision not in (None, "", "fp16", "bf16", "fp32"):
-            return (
-                "latent_upscale_precision must be fp16/bf16/fp32, "
-                f"got {latent_upscale_precision!r}"
-            )
+        # Never block Queue on these combos. Old workflows, converted-widget
+        # reshuffles, and combo indexes can land '' / 1 / True here; export()
+        # coerces to safe defaults.
         return True
+
+    @staticmethod
+    def _coerce_latent_layer(value):
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+        if value in (None, ""):
+            return "auto"
+        text = str(value).strip().lower()
+        if text in ("auto", "draft", "refine"):
+            return text
+        # Shifted widgets_values often land ai_skip_first=1 (or True) here.
+        # Never treat bare ints as combo indexes — prefer safe draft/refine via
+        # an explicit string from the Extender layer selector.
+        return "auto"
+
+    @staticmethod
+    def _coerce_upscale_precision(value):
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+        if value in (None, ""):
+            return "bf16"
+        text = str(value).strip().lower()
+        if text in ("fp16", "bf16", "fp32"):
+            return text
+        return "bf16"
+
+    @staticmethod
+    def _coerce_upscale_model(value):
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+        name = str(value or "").strip()
+        if name in ("", "None", "none", "null"):
+            return "None"
+        # Shifted widgets_values: precision / layer / megapixels leak into model.
+        low = name.lower()
+        if low in ("auto", "draft", "refine", "fp16", "bf16", "fp32"):
+            return "None"
+        try:
+            float(name)
+            return "None"
+        except (TypeError, ValueError):
+            pass
+        try:
+            from .latent_upscaler import scan_upscale_models
+
+            allowed = set(scan_upscale_models())
+        except Exception:
+            allowed = {"None"}
+        if name not in allowed:
+            return "None"
+        return name
+
+    @staticmethod
+    def _coerce_upscale_megapixels(value, default=1.2):
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+        try:
+            mp = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not (0.1 <= mp <= 8.0):
+            return float(default)
+        return mp
 
     def export(
         self,
@@ -5801,12 +5858,30 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         extra_pnginfo=None,
     ):
         global _ACTIVE_UPSCALE_CTX
-        if str(latent_layer or "").strip() == "":
-            latent_layer = "auto"
-        if str(latent_upscale_model or "").strip() == "":
-            latent_upscale_model = "None"
-        if str(latent_upscale_precision or "").strip() == "":
-            latent_upscale_precision = "bf16"
+        coerced_layer = self._coerce_latent_layer(latent_layer)
+        if coerced_layer != str(latent_layer or "").strip().lower():
+            _LOG.warning(
+                "Disk Final Decode: coerced latent_layer %r -> %r "
+                "(shifted widgets_values / legacy workflow)",
+                latent_layer,
+                coerced_layer,
+            )
+        latent_layer = coerced_layer
+        coerced_model = self._coerce_upscale_model(latent_upscale_model)
+        if coerced_model != str(latent_upscale_model or "").strip():
+            _LOG.warning(
+                "Disk Final Decode: coerced latent_upscale_model %r -> %r "
+                "(shifted widgets_values / legacy workflow)",
+                latent_upscale_model,
+                coerced_model,
+            )
+        latent_upscale_model = coerced_model
+        latent_upscale_precision = self._coerce_upscale_precision(
+            latent_upscale_precision
+        )
+        latent_upscale_megapixels = self._coerce_upscale_megapixels(
+            latent_upscale_megapixels
+        )
 
         (
             ref_frames_offset,
