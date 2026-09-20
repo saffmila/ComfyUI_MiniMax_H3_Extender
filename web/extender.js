@@ -1059,6 +1059,13 @@ function activateModeState(state, mode) {
     return state;
 }
 
+function normalizedManualResolution(value) {
+    const width = Number(value?.width || 0);
+    const height = Number(value?.height || 0);
+    if (!(width > 0) || !(height > 0)) return null;
+    return { width, height };
+}
+
 function parseState(raw) {
     try {
         const p = JSON.parse(raw || "{}");
@@ -1101,6 +1108,7 @@ function parseState(raw) {
             // cannot make ComfyUI reuse the just-finished Extender output instead
             // of entering the backend again to resume the checkpoint.
             resume_nonce: String(payload?.resume_nonce || ""),
+            manual_resolution: normalizedManualResolution(payload?.manual_resolution),
             clips: activeClips,
             mode_clips: {
                 ref2va: ref2vaClips,
@@ -1117,6 +1125,7 @@ function parseState(raw) {
         load_token: "",
         prompt_pack_signature: "",
         resume_nonce: "",
+        manual_resolution: null,
         clips: ref2vaClips,
         mode_clips: { ref2va: ref2vaClips, fl2va: blankModeClips() },
     };
@@ -1137,6 +1146,8 @@ function serializeState(state) {
             fl2va: state.mode_clips.fl2va,
         },
     };
+    const manualResolution = normalizedManualResolution(state?.manual_resolution);
+    if (manualResolution) payload.manual_resolution = manualResolution;
     if (state?.load_token) payload.project_load_token = String(state.load_token);
     if (state?.prompt_pack_signature) payload.prompt_pack_signature = String(state.prompt_pack_signature);
     if (state?.resume_nonce) payload.resume_nonce = String(state.resume_nonce);
@@ -1183,6 +1194,8 @@ function mergeActiveStateJson(runtime, raw, explicitMode = null) {
     runtime.state.load_token = incoming.load_token || runtime.state.load_token || "";
     runtime.state.prompt_pack_signature = incoming.prompt_pack_signature || "";
     runtime.state.resume_nonce = incoming.resume_nonce || runtime.state.resume_nonce || "";
+    runtime.state.manual_resolution = normalizedManualResolution(incoming.manual_resolution)
+        || normalizedManualResolution(runtime.state.manual_resolution);
     return runtime.state;
 }
 
@@ -1551,11 +1564,24 @@ function rememberManualResolution(node, runtime, width, height) {
     if (!runtime) return;
     if (Number(width) > 0) runtime.manualWidth = Number(width);
     if (Number(height) > 0) runtime.manualHeight = Number(height);
+    if (runtime.state && runtime.manualWidth > 0 && runtime.manualHeight > 0) {
+        runtime.state.manual_resolution = {
+            width: Number(runtime.manualWidth),
+            height: Number(runtime.manualHeight),
+        };
+    }
     if (node) {
         node.properties = node.properties || {};
         if (runtime.manualWidth > 0) node.properties.h3_manual_width = runtime.manualWidth;
         if (runtime.manualHeight > 0) node.properties.h3_manual_height = runtime.manualHeight;
     }
+}
+
+function persistManualResolutionFallback(node, runtime) {
+    if (!node || !runtime?.state || !runtime?.jsonWidget) return;
+    runtime.jsonWidget.value = serializeState(runtime.state);
+    notifyWorkflowChanged(node, runtime);
+    captureNativeWorkflowState(node, runtime);
 }
 
 function syncResolutionMirror(node, runtime) {
@@ -1652,6 +1678,7 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
                 runtime.manualHeight,
             );
             invalidateForResolutionChange(node, runtime);
+            persistManualResolutionFallback(node, runtime);
         } else {
             requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
         }
@@ -1668,6 +1695,7 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
                 Number(value || heightWidget?.value || runtime.manualHeight || 576),
             );
             invalidateForResolutionChange(node, runtime);
+            persistManualResolutionFallback(node, runtime);
         } else {
             requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
         }
@@ -1682,6 +1710,11 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
                 Number(widthWidget?.value || runtime.manualWidth || 896),
                 Number(heightWidget?.value || runtime.manualHeight || 576),
             );
+            // Auto without a usable reference keeps the current Manual geometry
+            // as its fallback. Persist it in the native clips_json state before
+            // any frontend rebuild/tab restoration can fall back to stale node
+            // properties or schema defaults (896x576).
+            persistManualResolutionFallback(node, runtime);
         }
         requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
     });
@@ -3679,6 +3712,7 @@ function applyProjectPayload(node, runtime, projectPayload) {
     runtime.state = parseState(rawClips);
     runtime.state.motion_context = explicitMotionContextFromStateJson(rawClips) ?? projectMotion;
     activateModeState(runtime.state, projectMode);
+    rememberManualResolution(node, runtime, savedManualW, savedManualH);
     // Loading a project mutates the disk cache outside ComfyUI's executor. A
     // one-shot token forces the Extender input hash to change even if every
     // visible setting happens to match the workflow that was previously run.
@@ -3723,6 +3757,10 @@ function freshProjectState(runtime) {
         load_token: `${Date.now().toString(36)}_${randomSeed().toString(36)}`,
         prompt_pack_signature: "",
         resume_nonce: "",
+        manual_resolution: normalizedManualResolution({
+            width: runtime?.manualWidth,
+            height: runtime?.manualHeight,
+        }),
         clips: activeClips,
         mode_clips: { ref2va: ref2vaClips, fl2va: fl2vaClips },
     };
@@ -5842,13 +5880,34 @@ function hydrateRuntimeFromNativeWidgets(node, runtime, restoreCache = false) {
         runtime.statusText = "Legacy image-ref sockets removed — load references in the Extender";
     }
 
-    if (String(getWidget(node, "resolution_mode")?.value || "manual") === "manual") {
+    const resolutionMode = String(getWidget(node, "resolution_mode")?.value || "manual");
+    const savedManualResolution = normalizedManualResolution(runtime.state?.manual_resolution);
+    if (resolutionMode === "manual") {
         rememberManualResolution(
             node,
             runtime,
             Number(getWidget(node, "width")?.value || runtime.manualWidth || 896),
             Number(getWidget(node, "height")?.value || runtime.manualHeight || 576),
         );
+    } else if (savedManualResolution) {
+        // Auto mirrors width/height, so the widgets are not a reliable place to
+        // recover the independent Manual fallback after a frontend rebuild.
+        rememberManualResolution(
+            node,
+            runtime,
+            savedManualResolution.width,
+            savedManualResolution.height,
+        );
+    } else if (!hasAutoResolutionGuide(runtime)) {
+        // Migration for workflows saved before v2.8.2: with Auto and no usable
+        // reference, the live width/height values are the actual fallback.
+        rememberManualResolution(
+            node,
+            runtime,
+            Number(getWidget(node, "width")?.value || runtime.manualWidth || 896),
+            Number(getWidget(node, "height")?.value || runtime.manualHeight || 576),
+        );
+        runtime.jsonWidget.value = serializeState(runtime.state);
     }
 
     render(node, runtime);
@@ -6201,8 +6260,18 @@ function buildUi(node) {
         guideSourceHeight: 0,
         resolutionFallback: false,
         resolutionMismatch: false,
-        manualWidth: Number(node?.properties?.h3_manual_width || getWidget(node, "width")?.value || 896),
-        manualHeight: Number(node?.properties?.h3_manual_height || getWidget(node, "height")?.value || 576),
+        manualWidth: Number(
+            normalizedManualResolution(state?.manual_resolution)?.width
+            || node?.properties?.h3_manual_width
+            || getWidget(node, "width")?.value
+            || 896
+        ),
+        manualHeight: Number(
+            normalizedManualResolution(state?.manual_resolution)?.height
+            || node?.properties?.h3_manual_height
+            || getWidget(node, "height")?.value
+            || 576
+        ),
         applyingResolutionMirror: false,
         resolutionMirrorActive: false,
         resolutionCallbacksInstalled: false,
