@@ -1,0 +1,79 @@
+name: Feature request
+description: Suggest a new feature or improvement for MiniMax H3 Extender
+title: "[Feature] "
+labels:
+  - enhancement
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before submitting a feature request
+
+        Please search through the existing **open and closed issues** first.
+
+        Your idea may already have been requested, discussed, rejected, or implemented.
+
+  - type: checkboxes
+    id: existing-issues
+    attributes:
+      label: Existing requests
+      description: Please confirm that you searched for an existing request before opening a new one.
+      options:
+        - label: I have searched the existing open and closed issues and did not find the same request.
+          required: true
+
+  - type: textarea
+    id: feature
+    attributes:
+      label: Feature description
+      description: Describe the feature or improvement you would like to see.
+      placeholder: |
+        I would like MiniMax H3 Extender to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or limitation
+      description: What problem would this feature solve? What is currently difficult or missing?
+      placeholder: |
+        Currently I have to...
+        This becomes a problem when...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: If you have an idea of how the feature should work or appear in the UI, describe it here.
+      placeholder: |
+        One possible approach would be...
+    validations:
+      required: false
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Example use case
+      description: Give a concrete example of how you would use this feature.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add screenshots, mockups, workflow examples, links, or any other useful information.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Final confirmation
+      options:
+        - label: This request is about MiniMax H3 Extender and is not a bug report.
+          required: true

@@ -1392,7 +1392,7 @@ def cached_fl2va_ids(manifest) -> set[str]:
     }
 
 
-def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, validated=False, run_mode="full_batch", dependency_meta=None, computed=False):
+def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, validated=False, run_mode="full_batch", dependency_meta=None, computed=False, generation_seed=None):
     """Append a new latent blob and atomically replace/insert one logical plan."""
     from .motion_context_disk import (
         _append_segment,
@@ -1421,6 +1421,8 @@ def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, v
         validated=bool(validated),
         manifest=manifest,
     )
+    if generation_seed is not None:
+        desc["generation_seed"] = int(generation_seed)
     desc["clip_id"] = clip_id
     desc["index"] = clip_index
     desc["trim_frames"] = 0
@@ -1557,6 +1559,8 @@ def export_fl2va_final(
     workflow=None,
     prompt=None,
     require_continuity=True,
+    project_autosave_settings=None,
+    save_individual_clips=False,
 ):
     """Decode FL2VA plans as independent hard cuts.
 
@@ -1747,7 +1751,12 @@ def export_fl2va_final(
     # sidecars and muxes audio; compressed video is never transcoded again.
     # ------------------------------------------------------------------
     progress = d._FinalDecodeNativeProgress(
-        unique_id, total=max(8, 5 + len(segments) * 2)
+        unique_id,
+        total=max(
+            8,
+            5 + len(segments) * 2
+            + (len(segments) if bool(save_individual_clips) else 0),
+        ),
     )
     requested_profile = d.normalize_full_batch_export_profile({
         "codec": codec, "crf": crf, "preset": preset,
@@ -1877,7 +1886,7 @@ def export_fl2va_final(
     preview_path = d._publish_full_preview(committed_path, unique_id)
     extension = d._full_batch_export_profile_extension(export_profile)
     output_path = d._next_output_path(out_dir, filename_prefix, extension)
-    final_video_mode = d._export_final_from_exact_segment_caches(
+    final_video_mode, individual_export_info = d._export_final_from_exact_segment_caches(
         ffmpeg=ffmpeg,
         segment_paths=exact_segment_paths,
         data_path=data_path,
@@ -1887,9 +1896,16 @@ def export_fl2va_final(
         export_profile=export_profile,
         audio_bitrate=audio_bitrate,
         token=token,
+        save_individual_clips=bool(save_individual_clips),
+        workflow=workflow,
+        prompt=prompt,
+        progress=progress,
     )
 
     d._embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
+    project_autosave_info = d._maybe_auto_save_project(
+        cache, output_path, unique_id, project_autosave_settings, len(segments), expected_frames
+    )
     progress.advance()
     d._LOG.info(
         "FL2VA incremental Full Decode: clips=%d frames=%d interrupted=%s video=%s output=%s",
@@ -1901,6 +1917,8 @@ def export_fl2va_final(
         "ui": {
             "h3_video": [item],
             "h3_preview_info": [{
+                **project_autosave_info,
+                **individual_export_info,
                 "mode": "fl2va_full_batch_incremental",
                 "clip": len(segments),
                 "preview_frames": expected_frames,

@@ -1,0 +1,153 @@
+name: Bug report
+description: Report a problem with MiniMax H3 Extender
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before opening a new issue
+
+        Please search through the existing **open and closed issues** before submitting a new one.
+
+        Your problem may already have been reported, discussed, or fixed in a newer version.
+
+  - type: checkboxes
+    id: existing-issues
+    attributes:
+      label: Existing issues
+      description: Please confirm that you searched for an existing report before opening a new issue.
+      options:
+        - label: I have searched the existing open and closed issues and did not find the same problem.
+          required: true
+
+  - type: checkboxes
+    id: latest-version
+    attributes:
+      label: Latest version
+      description: Please make sure you are using the latest available version before reporting a bug.
+      options:
+        - label: I have tested this issue with the latest available version of MiniMax H3 Extender.
+          required: true
+
+  - type: input
+    id: extender-version
+    attributes:
+      label: MiniMax H3 Extender version
+      description: Which version are you using?
+      placeholder: "e.g. 2.7.11"
+    validations:
+      required: true
+
+  - type: input
+    id: comfyui-version
+    attributes:
+      label: ComfyUI version
+      description: Enter your ComfyUI version if known.
+      placeholder: "e.g. 0.34.1"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: frontend
+    attributes:
+      label: ComfyUI frontend
+      description: Which frontend mode are you using?
+      options:
+        - Legacy
+        - Nodes 2.0
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: generation-mode
+    attributes:
+      label: Generation mode
+      description: Which MiniMax H3 mode were you using when the issue occurred?
+      options:
+        - Ref2VA - Motion Context ON
+        - Ref2VA - Motion Context OFF
+        - FL2VA
+        - Other / Not applicable
+    validations:
+      required: true
+
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: Run mode
+      description: Which execution mode were you using?
+      options:
+        - Clip-by-Clip
+        - Full Batch
+        - Both
+        - Not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the issue
+      description: Clearly explain what happened and what you expected to happen.
+      placeholder: |
+        What happened?
+
+        What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Please provide the exact steps needed to reproduce the problem.
+      placeholder: |
+        1. Add 3 clips
+        2. Generate clips 1 and 2
+        3. ...
+        4. The error appears
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error message / console log
+      description: Paste the complete error message or relevant ComfyUI console output here.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Workflow / additional information
+      description: |
+        Attach your workflow JSON/PNG if useful, along with screenshots, videos, logs, or any additional information that may help reproduce the issue.
+    validations:
+      required: false
+
+  - type: textarea
+    id: system
+    attributes:
+      label: System information
+      description: GPU, operating system, VRAM, Python/PyTorch versions, or anything else that may be relevant.
+      placeholder: |
+        OS: Windows 11
+        GPU: RTX 4060 Ti 16 GB
+        Python:
+        PyTorch:
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Final confirmation
+      options:
+        - label: I have provided enough information to reproduce or investigate the issue.
+          required: true

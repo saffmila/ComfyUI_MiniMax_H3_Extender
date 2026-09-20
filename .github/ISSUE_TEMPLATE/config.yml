@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Search existing issues
+    url: https://github.com/tritant/ComfyUI_MiniMax_H3_Extender/issues
+    about: Please search existing open and closed issues before creating a new one.

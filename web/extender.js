@@ -125,6 +125,8 @@ const FINAL_PROJECT_WIDGETS = [
     "crf",
     "preset",
     "audio_bitrate",
+    "auto_save_project",
+    "save_individual_clips",
 ];
 
 function boolValue(value, defaultValue = true) {
@@ -142,6 +144,13 @@ function ref2vaIndependentMode(state) {
 
 function randomAccessMode(state) {
     return String(state?.generation_mode || "ref2va") === "fl2va" || ref2vaIndependentMode(state);
+}
+
+function clipHasPhysicalCache(runtime, clip, index) {
+    if (randomAccessMode(runtime?.state)) {
+        return runtime?.cachedClipIds?.has(String(clip?.id || "")) || false;
+    }
+    return Number(index) >= 0 && Number(index) < Number(runtime?.cachedCount || 0);
 }
 
 function validationStateKey(modeOrState = "ref2va", motionContext = null) {
@@ -349,9 +358,9 @@ function addDynamicRefInput(node, name, type, tooltip = "") {
     }
 }
 
-function removeDynamicRefInput(node, name) {
+function removeDynamicRefInput(node, name, linkSnapshot = null) {
     const entry = findInputEntry(node, name);
-    if (!entry || inputConnected(entry.input)) return false;
+    if (!entry || inputConnectedDuringSync(linkSnapshot, entry.input)) return false;
     try {
         node.removeInput(entry.slot);
         return true;
@@ -480,6 +489,13 @@ async function prepareLocalRefMutation(node, runtime, clipIndex) {
     } else {
         invalidateFrom(runtime.state, index);
     }
+
+    // A future Ref2VA Motion-Context card may legitimately have local refs
+    // before it has ever been generated. In that case there is no disk segment
+    // to invalidate, so do not send an out-of-range clip_index to the manifest
+    // route. The new local ref will simply be part of that clip's first render.
+    if (!clipHasPhysicalCache(runtime, clip, index)) return true;
+
     if (!(await persistLocalRefInvalidation(node, runtime, index))) return false;
     return true;
 }
@@ -495,7 +511,147 @@ function graphLinkById(graph, linkId) {
     return null;
 }
 
-function normalizeDynamicReferenceInputOrder(node) {
+function graphIncomingLinksBySlot(node) {
+    const result = new Map();
+    const graph = node?.graph;
+    if (!graph || node?.id === null || node?.id === undefined) return result;
+    const seen = new Set();
+    const collect = (store) => {
+        if (!store) return;
+        let values = [];
+        try {
+            if (store instanceof Map) values = Array.from(store.values());
+            else if (Array.isArray(store)) values = store;
+            else if (typeof store === "object") values = Object.values(store);
+        } catch (_) {
+            return;
+        }
+        for (const link of values) {
+            if (!link || seen.has(link)) continue;
+            seen.add(link);
+            if (String(link.target_id) !== String(node.id)) continue;
+            const slot = Number(link.target_slot);
+            if (Number.isInteger(slot)) result.set(slot, link);
+        }
+    };
+    collect(graph.links);
+    collect(graph._links);
+    return result;
+}
+
+function inputLinkAtSlot(node, slot, graphLinksBySlot = null) {
+    if (!node || !Number.isInteger(Number(slot))) return null;
+    const index = Number(slot);
+
+    // Prefer ComfyUI/LiteGraph's slot API while the original socket order is
+    // still intact. Some frontends expose input.link only as a view derived from
+    // the input's current numeric position, so reading it after a reorder is too
+    // late to identify the cable that belonged to the socket.
+    if (typeof node.getInputLink === "function") {
+        try {
+            const resolved = node.getInputLink(index);
+            const link = (resolved && typeof resolved === "object")
+                ? resolved
+                : graphLinkById(node.graph, resolved);
+            if (link && String(link.target_id) === String(node.id)) return link;
+        } catch (_) {}
+    }
+
+    const bySlot = graphLinksBySlot || graphIncomingLinksBySlot(node);
+    const stored = bySlot.get(index) || null;
+    if (stored && String(stored.target_id) === String(node.id)) return stored;
+
+    // Very old LiteGraph fallback where each input owns a concrete link id.
+    const input = node.inputs?.[index];
+    const legacy = graphLinkById(node.graph, input?.link);
+    if (legacy && String(legacy.target_id) === String(node.id)) return legacy;
+    return null;
+}
+
+function snapshotIncomingInputLinks(node) {
+    const records = [];
+    const connectedInputs = new Set();
+    if (!node?.inputs?.length) return { records, connectedInputs };
+
+    const graphLinksBySlot = graphIncomingLinksBySlot(node);
+    const seenLinks = new Set();
+    for (let slot = 0; slot < node.inputs.length; slot++) {
+        const input = node.inputs[slot];
+        const link = inputLinkAtSlot(node, slot, graphLinksBySlot);
+        if (!link || seenLinks.has(link)) continue;
+        seenLinks.add(link);
+        connectedInputs.add(input);
+        records.push({
+            input,
+            name: String(input?.name || ""),
+            link,
+            originalSlot: slot,
+        });
+    }
+    return { records, connectedInputs };
+}
+
+function inputConnectedDuringSync(snapshot, input) {
+    return Boolean(snapshot?.connectedInputs?.has(input) || inputConnected(input));
+}
+
+function restoreIncomingInputLinks(node, snapshot) {
+    if (!node?.inputs?.length || !snapshot?.records?.length) return;
+
+    const slotByInput = new Map();
+    const slotByName = new Map();
+    node.inputs.forEach((input, slot) => {
+        slotByInput.set(input, slot);
+        const name = String(input?.name || "");
+        if (name && !slotByName.has(name)) slotByName.set(name, slot);
+    });
+
+    const moves = [];
+    for (const record of snapshot.records) {
+        const slot = slotByInput.has(record.input)
+            ? slotByInput.get(record.input)
+            : slotByName.get(record.name);
+        if (!Number.isInteger(slot)) continue;
+        const link = record.link;
+        if (!link || String(link.target_id) !== String(node.id)) continue;
+        if (Number(link.target_slot) !== slot) moves.push({ link, slot, name: record.name });
+    }
+    if (!moves.length) return;
+
+    // Temporarily vacate every moving destination before placing the links on
+    // their final sockets. This avoids slot collisions when two connected inputs
+    // exchange positions in frontends that validate target-slot ownership.
+    const incoming = graphIncomingLinksBySlot(node);
+    let highestSlot = node.inputs.length;
+    for (const slot of incoming.keys()) highestSlot = Math.max(highestSlot, Number(slot) || 0);
+    for (const { link } of moves) highestSlot = Math.max(highestSlot, Number(link.target_slot) || 0);
+    const parkBase = highestSlot + node.inputs.length + 1024;
+
+    try {
+        moves.forEach(({ link }, index) => {
+            link.target_slot = parkBase + index;
+        });
+        for (const { link, slot } of moves) link.target_slot = slot;
+    } catch (error) {
+        // Legacy LiteGraph uses plain numeric target_slot values; newer stores may
+        // expose validating setters. Always make one best-effort final placement
+        // before reporting the failure so a temporary parking slot cannot persist.
+        for (const { link, slot } of moves) {
+            try { link.target_slot = slot; } catch (_) {}
+        }
+        console.warn("[MiniMax H3 Extender] Failed to fully restore input links after socket reorder", error);
+    }
+
+    for (const { link, slot, name } of moves) {
+        if (Number(link.target_slot) !== slot) {
+            console.warn(
+                `[MiniMax H3 Extender] Input link restore mismatch for ${name || `slot ${slot}`}: expected ${slot}, got ${String(link.target_slot)}`
+            );
+        }
+    }
+}
+
+function normalizeDynamicReferenceInputOrder(node, linkSnapshot = null) {
     // addInput() always appends sockets, so an autogrown ref_audio_3 could end up
     // below the already-visible video sockets. Rebuild only the visual socket
     // order after each sync while preserving the exact input objects and cables.
@@ -551,18 +707,9 @@ function normalizeDynamicReferenceInputOrder(node) {
         && desired.every((input, slot) => node.inputs[slot] === input);
     if (alreadyOrdered) return false;
 
+    const snapshot = linkSnapshot || snapshotIncomingInputLinks(node);
     node.inputs.splice(0, node.inputs.length, ...desired);
-
-    // LiteGraph stores target sockets as numeric indices. Re-point every linked
-    // input after the visual reorder so existing workflows keep all cables.
-    for (let slot = 0; slot < node.inputs.length; slot++) {
-        const input = node.inputs[slot];
-        if (!inputConnected(input)) continue;
-        const link = graphLinkById(node.graph, input.link);
-        if (link && String(link.target_id) === String(node.id)) {
-            link.target_slot = slot;
-        }
-    }
+    restoreIncomingInputLinks(node, snapshot);
     return true;
 }
 
@@ -575,7 +722,7 @@ function renameInputPreservingLink(input, name) {
     return true;
 }
 
-function migrateLegacyStandaloneAudio(node) {
+function migrateLegacyStandaloneAudio(node, linkSnapshot = null) {
     // v14.64/14.65 kept the old single `ref_audio` socket as a backend alias.
     // New nodes should not show it. When loading an older workflow with a cable
     // on that socket, rename the socket in place to ref_audio_1 so the cable is
@@ -584,7 +731,7 @@ function migrateLegacyStandaloneAudio(node) {
     if (!legacy) return false;
 
     const canonical = findInputEntry(node, "ref_audio_1");
-    if (!inputConnected(legacy.input)) {
+    if (!inputConnectedDuringSync(linkSnapshot, legacy.input)) {
         try {
             node.removeInput(legacy.slot);
             return true;
@@ -593,13 +740,13 @@ function migrateLegacyStandaloneAudio(node) {
         }
     }
 
-    if (canonical && !inputConnected(canonical.input)) {
+    if (canonical && !inputConnectedDuringSync(linkSnapshot, canonical.input)) {
         try {
             node.removeInput(canonical.slot);
         } catch (_) {
             return false;
         }
-    } else if (canonical && inputConnected(canonical.input)) {
+    } else if (canonical && inputConnectedDuringSync(linkSnapshot, canonical.input)) {
         // Extremely unusual transitional workflow with both sockets connected:
         // keep both rather than destroying either cable. Backend compatibility
         // remains authoritative for this one legacy edge case.
@@ -622,13 +769,13 @@ function highestConnectedIndex(node, regex, maxIndex) {
     return highest;
 }
 
-function desiredGlobalDynamicSlots(node, runtime, regex, limit, kind) {
+function desiredGlobalDynamicSlots(node, runtime, regex, limit, kind, linkSnapshot = null) {
     const reserved = localSlotReservations(runtime, kind);
     const connected = new Set();
     let highestConnected = 0;
     for (const input of node?.inputs || []) {
         const match = String(input?.name || "").match(regex);
-        if (!match || !inputConnected(input)) continue;
+        if (!match || !inputConnectedDuringSync(linkSnapshot, input)) continue;
         const slot = Number(match[1]);
         if (!(slot >= 1 && slot <= limit)) continue;
         connected.add(slot);
@@ -657,8 +804,9 @@ function syncDynamicAVReferenceInputs(node, runtime = null) {
     runtime = runtime || node.__h3Extender || null;
     node.__h3AVRefSyncing = true;
     let changed = false;
+    const linkSnapshot = snapshotIncomingInputLinks(node);
     try {
-        changed = migrateLegacyStandaloneAudio(node) || changed;
+        changed = migrateLegacyStandaloneAudio(node, linkSnapshot) || changed;
 
         // ---- Standalone audio refs -------------------------------------------------
         // Classic autogrow: always show ref_audio_1, then one free socket after
@@ -666,7 +814,7 @@ function syncDynamicAVReferenceInputs(node, runtime = null) {
         // higher slots are never removed, so loading sparse/older workflows does
         // not destroy cables.
         const desiredAudioSlots = desiredGlobalDynamicSlots(
-            node, runtime, REF_AUDIO_RE, MAX_STANDALONE_AUDIO_REFS, "audio"
+            node, runtime, REF_AUDIO_RE, MAX_STANDALONE_AUDIO_REFS, "audio", linkSnapshot
         );
         for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
             const name = `ref_audio_${i}`;
@@ -678,7 +826,7 @@ function syncDynamicAVReferenceInputs(node, runtime = null) {
                     `Optional MiniMax H3 standalone reference audio ${i}.`,
                 ) || changed;
             } else {
-                changed = removeDynamicRefInput(node, name) || changed;
+                changed = removeDynamicRefInput(node, name, linkSnapshot) || changed;
             }
         }
 
@@ -689,7 +837,7 @@ function syncDynamicAVReferenceInputs(node, runtime = null) {
         // even if its video is temporarily disconnected, allowing the user to fix
         // the pair instead of silently losing the cable.
         const desiredVideoSlots = desiredGlobalDynamicSlots(
-            node, runtime, REF_VIDEO_RE, MAX_VIDEO_REFS, "video"
+            node, runtime, REF_VIDEO_RE, MAX_VIDEO_REFS, "video", linkSnapshot
         );
 
         for (let i = 1; i <= MAX_VIDEO_REFS; i++) {
@@ -699,9 +847,9 @@ function syncDynamicAVReferenceInputs(node, runtime = null) {
             const videoEntry = findInputEntry(node, videoName);
             const fpsEntry = findInputEntry(node, fpsName);
             const audioEntry = findInputEntry(node, audioName);
-            const videoIsConnected = inputConnected(videoEntry?.input);
-            const fpsIsConnected = inputConnected(fpsEntry?.input);
-            const audioIsConnected = inputConnected(audioEntry?.input);
+            const videoIsConnected = inputConnectedDuringSync(linkSnapshot, videoEntry?.input);
+            const fpsIsConnected = inputConnectedDuringSync(linkSnapshot, fpsEntry?.input);
+            const audioIsConnected = inputConnectedDuringSync(linkSnapshot, audioEntry?.input);
             const companionConnected = fpsIsConnected || audioIsConnected;
 
             // Preserve the numbered video socket if one of its companion cables
@@ -715,16 +863,16 @@ function syncDynamicAVReferenceInputs(node, runtime = null) {
                     `Optional MiniMax H3 reference video ${i} as an IMAGE frame batch. Connect the matching fps output from Get Video Components when the source is not already 24 fps. Use <Video ${i}> in prompts.`,
                 ) || changed;
             } else {
-                changed = removeDynamicRefInput(node, videoName) || changed;
+                changed = removeDynamicRefInput(node, videoName, linkSnapshot) || changed;
             }
 
             // Re-read after potential video insertion/removal.
             const liveVideo = findInputEntry(node, videoName);
             const liveFps = findInputEntry(node, fpsName);
             const liveAudio = findInputEntry(node, audioName);
-            const liveVideoConnected = inputConnected(liveVideo?.input);
-            const liveFpsConnected = inputConnected(liveFps?.input);
-            const liveAudioConnected = inputConnected(liveAudio?.input);
+            const liveVideoConnected = inputConnectedDuringSync(linkSnapshot, liveVideo?.input);
+            const liveFpsConnected = inputConnectedDuringSync(linkSnapshot, liveFps?.input);
+            const liveAudioConnected = inputConnectedDuringSync(linkSnapshot, liveAudio?.input);
 
             // Once Video N is connected, expose both companion inputs directly:
             // FLOAT fps from Get Video Components + optional matching soundtrack.
@@ -737,7 +885,7 @@ function syncDynamicAVReferenceInputs(node, runtime = null) {
                     `Source FPS of ref_video_${i}. Connect Get Video Components → fps. Leave disconnected only when the IMAGE batch is already 24 fps.`,
                 ) || changed;
             } else {
-                changed = removeDynamicRefInput(node, fpsName) || changed;
+                changed = removeDynamicRefInput(node, fpsName, linkSnapshot) || changed;
             }
 
             if (liveVideoConnected || liveAudioConnected) {
@@ -748,11 +896,11 @@ function syncDynamicAVReferenceInputs(node, runtime = null) {
                     `Optional soundtrack of ref_video_${i}.`,
                 ) || changed;
             } else {
-                changed = removeDynamicRefInput(node, audioName) || changed;
+                changed = removeDynamicRefInput(node, audioName, linkSnapshot) || changed;
             }
         }
 
-        changed = normalizeDynamicReferenceInputOrder(node) || changed;
+        changed = normalizeDynamicReferenceInputOrder(node, linkSnapshot) || changed;
         if (changed) node.graph?.setDirtyCanvas(true, true);
     } finally {
         node.__h3AVRefSyncing = false;
@@ -1112,6 +1260,7 @@ function invalidateFrom(state, index, refineMode = false) {
 async function restoreCacheState(node, runtime) {
     if (!node || !runtime || runtime.hydrating || runtime.cacheStateRequestRunning) return;
 
+    const requestEpoch = Number(runtime.cacheStateEpoch || 0);
     runtime.cacheStateRequestRunning = true;
     try {
         const params = new URLSearchParams();
@@ -1125,6 +1274,10 @@ async function restoreCacheState(node, runtime) {
 
         const payload = await response.json();
         if (!payload?.found) return;
+        // New Project can invalidate a startup cache-state request while its
+        // fetch is in flight. Never let that stale response repopulate the
+        // freshly cleared project UI.
+        if (requestEpoch !== Number(runtime.cacheStateEpoch || 0)) return;
 
         // Do not overwrite live execution information if generation started
         // while the startup request was in flight.
@@ -2987,6 +3140,40 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
     document.body.appendChild(overlay);
 }
 
+function hasSystemFileDragPayload(event) {
+    const transfer = event?.dataTransfer;
+    if (!transfer) return false;
+
+    // During dragover Firefox/Windows may intentionally keep dataTransfer.files
+    // empty until the actual drop. The Files type is the reliable signal that
+    // an operating-system file drag is crossing this slot.
+    const types = Array.from(transfer.types || []);
+    return types.includes("Files");
+}
+
+function singleSystemImageFileFromDropEvent(event) {
+    const transfer = event?.dataTransfer;
+    if (!transfer) return null;
+
+    const files = Array.from(transfer.files || []);
+    if (files.length !== 1) return null;
+
+    // External file drags expose the native Files payload. Internal ComfyUI
+    // drags are deliberately unsupported here; they use their own payloads.
+    const types = Array.from(transfer.types || []);
+    if (types.length && !types.includes("Files")) return null;
+
+    const items = Array.from(transfer.items || []);
+    if (items.length && (items.length !== 1 || String(items[0]?.kind || "") !== "file")) return null;
+
+    const file = files[0];
+    const mime = String(file?.type || "").toLowerCase();
+    const name = String(file?.name || "");
+    if (!mime.startsWith("image/") && !/\.(png|jpe?g|webp|bmp|tiff?)$/i.test(name)) return null;
+
+    return file;
+}
+
 async function uploadReference(node, runtime, slotIndex, file) {
     if (!node || !runtime || !file) return;
     if (projectBusy(runtime)) {
@@ -3505,7 +3692,24 @@ function removeReference(node, runtime, slotIndex) {
     }
     const oldName = runtime.refsState.refs[slotIndex]?.original_name || `Ref ${slotIndex + 1}`;
     runtime.refsState.refs[slotIndex] = null;
+
+    // Nodes 2.0 can postpone the custom DOM-widget repaint triggered through
+    // graph.change()/setDirtyCanvas until the next node interaction. Redraw the
+    // reference strip from the already-updated runtime state immediately so the
+    // slot becomes visibly free on the first click. A second redraw on the next
+    // animation frame wins over any deferred Vue/LiteGraph paint from this same
+    // pointer event without changing reference/invalidation semantics.
+    renderReferences(node, runtime);
+    node.graph?.setDirtyCanvas?.(true, true);
+
     handleReferenceChange(node, runtime, `${oldName} removed`);
+
+    requestAnimationFrame(() => {
+        if (!runtime?.refsRow) return;
+        if (runtime.state?.generation_mode === "fl2va") return;
+        renderReferences(node, runtime);
+        node.graph?.setDirtyCanvas?.(true, true);
+    });
 }
 
 function nodeIs(node, className) {
@@ -4001,6 +4205,13 @@ function applyProjectPayload(node, runtime, projectPayload) {
     const finalSettings = projectPayload?.final_decode?.settings;
     const finalNode = connectedFinalDecode(node);
     if (finalNode && finalSettings && typeof finalSettings === "object") {
+        // Older projects predate autosave: loading them keeps it opt-in.
+        if (!Object.prototype.hasOwnProperty.call(finalSettings, "auto_save_project")) {
+            setWidgetValue(finalNode, "auto_save_project", false);
+        }
+        if (!Object.prototype.hasOwnProperty.call(finalSettings, "save_individual_clips")) {
+            setWidgetValue(finalNode, "save_individual_clips", false);
+        }
         for (const name of FINAL_PROJECT_WIDGETS) {
             if (Object.prototype.hasOwnProperty.call(finalSettings, name)) {
                 setWidgetValue(finalNode, name, finalSettings[name]);
@@ -4012,6 +4223,82 @@ function applyProjectPayload(node, runtime, projectPayload) {
     node.graph?.setDirtyCanvas(true, true);
 }
 
+function freshProjectState(runtime) {
+    const generationMode = String(runtime?.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    const motionContext = runtime?.state?.motion_context !== false;
+    const ref2vaClips = blankModeClips();
+    const fl2vaClips = blankModeClips();
+    const activeClips = generationMode === "fl2va" ? fl2vaClips : ref2vaClips;
+    return {
+        version: 2,
+        generation_mode: generationMode,
+        motion_context: motionContext,
+        causal_lineage: activeClips.map((clip) => String(clip.id)),
+        // Force a fresh ComfyUI input hash even when every global widget keeps
+        // exactly the same value as the previous project.
+        load_token: `${Date.now().toString(36)}_${randomSeed().toString(36)}`,
+        prompt_pack_signature: "",
+        resume_nonce: "",
+        clips: activeClips,
+        mode_clips: { ref2va: ref2vaClips, fl2va: fl2vaClips },
+    };
+}
+
+function resetRuntimeForNewProject(node, runtime) {
+    if (!node || !runtime) return;
+
+    runtime.state = freshProjectState(runtime);
+    runtime.refsState = emptyRefsState();
+
+    runtime.cachedCount = 0;
+    runtime.validatedCount = 0;
+    runtime.cachedClipIds = new Set();
+    runtime.validatedClipIds = new Set();
+    runtime.computedIndices = new Set();
+    runtime.computedClipIds = new Set();
+    runtime.checkpointActive = false;
+    runtime.checkpointInterrupted = false;
+    runtime.checkpointSnapshotCount = 0;
+    runtime.cacheStateEpoch = Number(runtime.cacheStateEpoch || 0) + 1;
+    runtime.cacheStateRestored = true;
+    runtime.cacheStateRequestRunning = false;
+    runtime.interruptRequested = false;
+    runtime.interruptRequestBusy = false;
+    runtime.continuitySignatures = new Map();
+    runtime.continuitySignatureRequests = new Set();
+    runtime.modeValidationState = {};
+    runtime.modeValidationOrder = {};
+
+    runtime.pendingRefSlot = -1;
+    runtime.pendingFrameClip = -1;
+    runtime.pendingFrameKind = "";
+    runtime.pendingFrameGuideIndex = -1;
+
+    // Cached/derived resolution belongs to the old project.  Keep the user's
+    // global resolution mode, megapixel value and Manual fallback untouched.
+    runtime.expectedResolution = null;
+    runtime.resolvedWidth = 0;
+    runtime.resolvedHeight = 0;
+    runtime.resolutionGuide = "";
+    runtime.guideSourceWidth = 0;
+    runtime.guideSourceHeight = 0;
+    runtime.resolutionFallback = false;
+    runtime.resolutionMismatch = false;
+    runtime.resolutionMirrorActive = false;
+    runtime.projectResolutionLoaded = false;
+    runtime.resolutionInvalidated = false;
+
+    runtime.projectName = "";
+    if (node.properties) delete node.properties.h3_project_name;
+
+    updateRefsHidden(node, runtime);
+    updateHidden(node, runtime);
+    // Do not touch any native/global widget value here. In Auto mode width and
+    // height may still display the last derived mirror until a new reference is
+    // loaded; that is preferable to New Project silently changing a setting.
+    captureNativeWorkflowState(node, runtime);
+}
+
 function projectBusy(runtime) {
     return ["preparing", "sampling", "complete"].includes(String(runtime?.activePhase || ""));
 }
@@ -4019,8 +4306,57 @@ function projectBusy(runtime) {
 function setProjectButtonsBusy(runtime, busy) {
     if (!runtime) return;
     runtime.projectOperationBusy = Boolean(busy);
+    if (runtime.newProjectButton) runtime.newProjectButton.disabled = Boolean(busy);
     if (runtime.saveProjectButton) runtime.saveProjectButton.disabled = Boolean(busy);
     if (runtime.loadProjectButton) runtime.loadProjectButton.disabled = Boolean(busy);
+}
+
+async function newProject(node, runtime) {
+    if (!node || !runtime) return;
+    if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) {
+        alert("Wait for the current Extender operation to finish before starting a new project.");
+        return;
+    }
+    if (!confirm(
+        "Start a new project?\n\n" +
+        "This permanently clears the Extender cache and all cached references, removes all prompts, " +
+        "and resets the timeline to one empty clip.\n\n" +
+        "Global node settings will be kept unchanged."
+    )) return;
+
+    setProjectButtonsBusy(runtime, true);
+    runtime.statusText = "Starting new project…";
+    render(node, runtime);
+    try {
+        const response = await fetch(api.apiURL("/h3_extender/project/new"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ owner_id: String(node.id) }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `New Project failed (${response.status}).`);
+        }
+
+        resetRuntimeForNewProject(node, runtime);
+        runtime.statusText = payload?.cleanup_pending
+            ? "New project ready | active cache cleared (old locked files pending OS cleanup)"
+            : "New project ready | cache cleared";
+        render(node, runtime);
+        syncDomHeight(node, runtime, false);
+        node.graph?.setDirtyCanvas(true, true);
+
+        window.dispatchEvent(new CustomEvent("h3-extender-new-project", {
+            detail: { owner_id: String(node.id) },
+        }));
+    } catch (error) {
+        runtime.statusText = "New Project failed";
+        render(node, runtime);
+        alert(String(error?.message || error));
+    } finally {
+        setProjectButtonsBusy(runtime, false);
+        render(node, runtime);
+    }
 }
 
 async function saveProject(node, runtime) {
@@ -4321,6 +4657,43 @@ function renderReferences(node, runtime) {
         }
         slot.appendChild(thumb);
 
+        // Global-reference drag & drop is intentionally only another entry point
+        // into uploadReference(): one native image file from the operating system
+        // onto one explicit slot. No slot remapping or alternate ref logic exists.
+        const resetDropHighlight = () => {
+            thumb.style.borderColor = "rgba(255,255,255,.15)";
+            thumb.style.background = "rgba(0,0,0,.24)";
+        };
+        slot.addEventListener("dragover", (event) => {
+            // Firefox does not necessarily expose dataTransfer.files until drop.
+            // Accept the native Files payload here so the browser cannot navigate
+            // away from ComfyUI when the user releases the image over the slot.
+            if (!hasSystemFileDragPayload(event)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (load.disabled) return;
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+            thumb.style.borderColor = "rgba(150,205,255,.95)";
+            thumb.style.background = "rgba(70,120,175,.22)";
+        });
+        slot.addEventListener("dragleave", (event) => {
+            if (event.relatedTarget && slot.contains?.(event.relatedTarget)) return;
+            resetDropHighlight();
+        });
+        slot.addEventListener("drop", async (event) => {
+            if (!hasSystemFileDragPayload(event)) return;
+            // Always consume an operating-system file drop over a Global Ref slot.
+            // Validation still happens below, so multi-file/non-image drops do
+            // nothing instead of triggering the browser's native file navigation.
+            event.preventDefault();
+            event.stopPropagation();
+            resetDropHighlight();
+            if (load.disabled) return;
+            const file = singleSystemImageFileFromDropEvent(event);
+            if (!file) return;
+            await uploadReference(node, runtime, index, file);
+        });
+
         const meta = document.createElement("div");
         meta.style.marginTop = "1px";
         meta.style.fontSize = "9px";
@@ -4609,6 +4982,40 @@ function renderFl2vaFrames(node, runtime) {
             }
             slot.appendChild(thumb);
 
+            // FL2VA First/Last drag & drop is only another entry point into
+            // uploadClipFrame(): one native image file from the operating system
+            // onto one explicit First/Last slot. Guides and internal ComfyUI drags
+            // remain unchanged and unsupported here.
+            const resetDropHighlight = () => {
+                thumb.style.borderColor = "rgba(255,255,255,.15)";
+                thumb.style.background = "rgba(0,0,0,.24)";
+            };
+            slot.addEventListener("dragover", (event) => {
+                // Firefox may keep dataTransfer.files empty until drop; the Files
+                // type is enough to consume the native drag and prevent navigation.
+                if (!hasSystemFileDragPayload(event)) return;
+                event.preventDefault();
+                event.stopPropagation();
+                if (load.disabled) return;
+                if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+                thumb.style.borderColor = "rgba(150,205,255,.95)";
+                thumb.style.background = "rgba(70,120,175,.22)";
+            });
+            slot.addEventListener("dragleave", (event) => {
+                if (event.relatedTarget && slot.contains?.(event.relatedTarget)) return;
+                resetDropHighlight();
+            });
+            slot.addEventListener("drop", async (event) => {
+                if (!hasSystemFileDragPayload(event)) return;
+                event.preventDefault();
+                event.stopPropagation();
+                resetDropHighlight();
+                if (load.disabled) return;
+                const file = singleSystemImageFileFromDropEvent(event);
+                if (!file) return;
+                await uploadClipFrame(node, runtime, clipIndex, kind, file);
+            });
+
             const meta = document.createElement("div");
             meta.style.marginTop = "1px";
             meta.style.fontSize = "9px";
@@ -4672,8 +5079,78 @@ function renderMediaStrip(node, runtime, fl2vaMode) {
     }
 }
 
+function capturePromptUiState(runtime) {
+    const cards = runtime?.cards;
+    if (!cards?.querySelectorAll) return;
+
+    const prompts = Array.from(cards.querySelectorAll("textarea[data-h3-prompt-clip-id]"));
+    if (!prompts.length) return;
+
+    if (!runtime.promptUiState?.set || !runtime.promptUiState?.get) runtime.promptUiState = new Map();
+    const active = document.activeElement;
+
+    for (const prompt of prompts) {
+        const clipId = String(prompt?.dataset?.h3PromptClipId || "");
+        if (!clipId) continue;
+
+        let selectionStart = null;
+        let selectionEnd = null;
+        let selectionDirection = "none";
+        try {
+            selectionStart = Number.isInteger(prompt.selectionStart) ? prompt.selectionStart : null;
+            selectionEnd = Number.isInteger(prompt.selectionEnd) ? prompt.selectionEnd : null;
+            selectionDirection = String(prompt.selectionDirection || "none");
+        } catch (_) {}
+
+        runtime.promptUiState.set(clipId, {
+            scrollTop: Number(prompt.scrollTop) || 0,
+            scrollLeft: Number(prompt.scrollLeft) || 0,
+            selectionStart,
+            selectionEnd,
+            selectionDirection,
+            focused: active === prompt,
+        });
+    }
+
+}
+
+function restorePromptUiState(prompt, runtime, clipId) {
+    const saved = runtime?.promptUiState?.get?.(String(clipId || ""));
+    if (!saved || !prompt) return;
+
+    // Restoring DOM focus during a Legacy LiteGraph layout pass can interfere
+    // with ComfyUI's DOM-widget width calculation (notably when the sidebar
+    // opens/closes). Preserve focus only in Nodes 2.0; Legacy still restores
+    // the caret/selection and textarea-local scroll without forcing focus.
+    if (saved.focused && domWidgetRenderMode(runtime?.root) === "nodes2") {
+        try {
+            prompt.focus({ preventScroll: true });
+        } catch (_) {
+            try { prompt.focus(); } catch (_) {}
+        }
+    }
+
+    if (Number.isInteger(saved.selectionStart) && Number.isInteger(saved.selectionEnd)) {
+        try {
+            prompt.setSelectionRange(
+                saved.selectionStart,
+                saved.selectionEnd,
+                saved.selectionDirection || "none",
+            );
+        } catch (_) {}
+    }
+
+    // focus()/setSelectionRange() may scroll a textarea to the caret in some
+    // browsers, so restore the user's viewport last.
+    prompt.scrollTop = Math.max(0, Number(saved.scrollTop) || 0);
+    prompt.scrollLeft = Math.max(0, Number(saved.scrollLeft) || 0);
+}
+
 function render(node, runtime) {
     const { state, cards, counter, status } = runtime;
+    // render() rebuilds every card. Capture textarea-local UI state first so
+    // long prompts do not jump back to the top after progress/status updates.
+    capturePromptUiState(runtime);
     cards.replaceChildren();
 
     const fl2vaMode = state.generation_mode === "fl2va";
@@ -5130,6 +5607,7 @@ function render(node, runtime) {
         const prompt = document.createElement("textarea");
         prompt.value = clip.prompt;
         prompt.spellcheck = false;
+        prompt.dataset.h3PromptClipId = String(clip.id || `clip_${index + 1}`);
         // Nodes 2.0 uses the wheel over the canvas for graph zoom. Mark only
         // the prompt textarea as a wheel-capturing DOM control so scrolling
         // inside a long prompt stays inside the prompt instead of zooming the graph.
@@ -5167,7 +5645,9 @@ function render(node, runtime) {
             updateHidden(node, runtime);
             // Do not rebuild the DOM while typing: that would steal focus.
         });
-        prompt.addEventListener("blur", () => render(node, runtime));
+        // The input handler already synchronizes clip.prompt. Re-rendering the
+        // whole node on blur destroyed/recreated this textarea and reset its
+        // native scroll position every time the user clicked elsewhere.
         card.appendChild(prompt);
 
         clip.loras = normalizeClipLoras(clip.loras, clip.lora);
@@ -5429,7 +5909,15 @@ function render(node, runtime) {
                             }
                         } else {
                             if (validated.checked) {
-                                clip.validated = true;
+                                // Ref2VA Motion ON: require physical cache before Validated
+                                // (same rule as random-access / upstream 2.7.8+).
+                                if (!clipHasPhysicalCache(runtime, clip, index)) {
+                                    clip.validated = false;
+                                    validated.checked = false;
+                                    runtime.statusText = `Clip ${index + 1} cannot be marked Validated because its cache does not exist yet.`;
+                                } else {
+                                    clip.validated = true;
+                                }
                             } else {
                                 invalidateFrom(state, index);
                             }
@@ -5642,6 +6130,7 @@ function render(node, runtime) {
         }
         card.appendChild(foot);
         cards.appendChild(card);
+        restorePromptUiState(prompt, runtime, clip.id);
     });
 
     // Nodes 2.0 can recompute the DOM-widget grid after the Extender rebuilds
@@ -6155,6 +6644,14 @@ function buildUi(node) {
         render(node, runtime);
     });
 
+    const newProjectButton = document.createElement("button");
+    newProjectButton.textContent = "New Project";
+    newProjectButton.title = "Clear all current Extender project data/cache and start with one empty clip; global settings are preserved";
+    newProjectButton.addEventListener("click", (e) => {
+        e.preventDefault();
+        newProject(node, runtime);
+    });
+
     const saveProjectButton = document.createElement("button");
     saveProjectButton.textContent = "Save Project";
     saveProjectButton.title = "Save settings + disk cache as a portable .ext project";
@@ -6208,7 +6705,7 @@ function buildUi(node) {
     status.style.textOverflow = "ellipsis";
     status.style.maxWidth = "55%";
 
-    toolbar.append(modeButton, motionButton, add, remove, saveProjectButton, loadProjectButton, interruptButton, counter, status, projectFileInput);
+    toolbar.append(modeButton, motionButton, add, remove, newProjectButton, saveProjectButton, loadProjectButton, interruptButton, counter, status, projectFileInput);
 
     const refFileInput = document.createElement("input");
     refFileInput.type = "file";
@@ -6279,6 +6776,7 @@ function buildUi(node) {
         cards,
         counter,
         status,
+        newProjectButton,
         saveProjectButton,
         loadProjectButton,
         interruptButton,
@@ -6336,6 +6834,7 @@ function buildUi(node) {
         activeClipIndex: -1,
         activePhase: "idle",
         cacheStateRequestRunning: false,
+        cacheStateEpoch: 0,
         cacheStateRestored: false,
         expectedResolution: null,
         resolvedWidth: 0,
@@ -6374,6 +6873,9 @@ function buildUi(node) {
         syncingFl2vaScroll: false,
         continuitySignatures: new Map(),
         continuitySignatureRequests: new Set(),
+        // UI-only textarea state. render() rebuilds cards frequently during a
+        // run; keep prompt scroll/caret/focus stable across those rebuilds.
+        promptUiState: new Map(),
         modeValidationState: {
             [validationStateKey(state)]: new Map(
                 (state.clips || []).map((clip) => [String(clip.id), Boolean(clip.validated)])
@@ -6387,6 +6889,29 @@ function buildUi(node) {
         // completed; custom controls never serialize a parallel state.
         hydrating: isH3GraphConfiguring(),
         ready: false,
+    };
+
+    // Capture UI-only fallback dimensions with the submitted job, before its
+    // seeds advance. Do not overwrite the widget or change rendering inputs.
+    const oldSerializeValue = jsonWidget.serializeValue;
+    jsonWidget.serializeValue = function (...args) {
+        const active = node.__h3Extender || runtime;
+        const manualResolution = {
+            width: Number(active.manualWidth || getWidget(node, "width")?.value || 896),
+            height: Number(active.manualHeight || getWidget(node, "height")?.value || 576),
+        };
+        const attach = (raw) => {
+            try {
+                const payload = JSON.parse(raw);
+                if (!payload || Array.isArray(payload) || typeof payload !== "object") return raw;
+                payload.project_manual_resolution = manualResolution;
+                return JSON.stringify(payload);
+            } catch (_) {
+                return raw;
+            }
+        };
+        const raw = oldSerializeValue ? oldSerializeValue.apply(this, args) : this.value;
+        return raw && typeof raw.then === "function" ? raw.then(attach) : attach(raw);
     };
 
     const oldAfterQueued = jsonWidget.afterQueued;

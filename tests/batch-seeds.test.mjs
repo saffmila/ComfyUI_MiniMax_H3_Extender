@@ -192,3 +192,21 @@ test("completion in another mode preserves each timeline's next seed", async () 
     assert.equal(f.state().clips[0].seed, 11);
     assert.equal(f.state().mode_clips.fl2va[0].seed, 71);
 });
+
+
+test("queued project metadata captures independent Manual fallback without advancing seeds", async () => {
+    const f = await fixture([clip("a", "increment", 10)]);
+    const widget = f.node.widgets[0];
+    const before = widget.value;
+    vm.runInContext("node.__h3Extender.manualWidth = 1024; node.__h3Extender.manualHeight = 640", f.context);
+    const first = JSON.parse(await widget.serializeValue());
+    assert.deepEqual(first.project_manual_resolution, { width: 1024, height: 640 });
+    assert.equal(first.clips[0].seed, 10);
+    assert.equal(widget.value, before);
+    widget.afterQueued({ isPartialExecution: false });
+    vm.runInContext("node.__h3Extender.manualWidth = 896; node.__h3Extender.manualHeight = 576", f.context);
+    const second = JSON.parse(await widget.serializeValue());
+    assert.deepEqual(second.project_manual_resolution, { width: 896, height: 576 });
+    assert.equal(second.clips[0].seed, 11);
+    assert.deepEqual(first.project_manual_resolution, { width: 1024, height: 640 });
+});

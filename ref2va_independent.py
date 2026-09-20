@@ -222,6 +222,7 @@ def store_segment(
     validated=False,
     run_mode="full_batch",
     computed=False,
+    generation_seed=None,
 ):
     """Append latent bytes and replace/insert one logical clip by stable id."""
     from . import motion_context_disk as d
@@ -243,6 +244,8 @@ def store_segment(
         validated=bool(validated),
         manifest=manifest,
     )
+    if generation_seed is not None:
+        desc["generation_seed"] = int(generation_seed)
     desc["clip_id"] = clip_id
     desc["index"] = clip_index
     desc["trim_frames"] = 0
@@ -976,6 +979,7 @@ def run(
             validated=False,
             run_mode=str(run_mode),
             computed=(str(run_mode) == "full_batch"),
+            generation_seed=cfg["seed"],
         )
         statuses.append(cache_status)
         generated.append(i)

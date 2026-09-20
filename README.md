@@ -6,6 +6,44 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+## 🆕 v2.8.0 — Optional individual Full Batch clip export
+
+Full Batch can now optionally save each final clip as a separate video file using the new **Save Individual Clips** option in **Final Decode / Preview**.
+
+The option is disabled by default, so the existing Full Batch workflow remains unchanged unless explicitly enabled.
+
+When enabled, individual clips are exported only after all normal processing is complete. They use the same final video segments as the assembled output, including seam correction, per-clip color adjustments and FL2VA visible-frame trimming/handoffs.
+
+Audio is captured during the same final PCM assembly pass used for the complete video, so no additional audio reconstruction pass is required.
+
+No additional sampling or VideoVAE decode is introduced. Individual video streams are reused with stream-copy and saved in a dedicated folder beside the final assembled video.
+
+Supported in:
+- Ref2VA Motion ON
+- Ref2VA Motion OFF
+- FL2VA
+
+---
+
+## 🆕 v2.7.7 — Full Batch Autosave
+
+- Optional automatic `.ext` project save after a successful **Full Batch**
+- Supports **Ref2VA Motion ON/OFF** and **FL2VA**
+- Preserves the **actual generation seed** and project settings
+- Clip-by-Clip behavior remains unchanged
+
+---
+
+### 🆕 v2.7.5 — New Project button
+
+Added a new **New Project** button to quickly start from a completely clean state.
+
+It clears all current project data and cached references, removes prompts, resets the timeline to a single empty clip, and wipes previous computed/validated state — while keeping all global node settings unchanged.
+
+Useful when switching to a completely different project and helps prevent old references or cached project data from carrying over into the next generation.
+
+---
+
 ### 🆕 Motion Context OFF
 
 Ref2VA now includes a **Motion Context ON/OFF** option.

@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.7.4"
+BUILD = "motion-context-disk-v2.8.1"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -1349,6 +1349,8 @@ class MiniMaxH3MotionContextDiskJoin:
         unique_id=None,
         reuse_existing=False,
         computed=False,
+        generation_seed=None,
+        generation_clip_id=None,
     ):
         data_path, manifest_path, manifest, mode, stop, index = _effective_state(
             previous_cache, run_mode, fps, unique_id
@@ -1428,6 +1430,10 @@ class MiniMaxH3MotionContextDiskJoin:
                 validated=bool(validated),
                 manifest=manifest,
             )
+            if generation_seed is not None:
+                desc["generation_seed"] = int(generation_seed)
+            if generation_clip_id is not None:
+                desc["clip_id"] = str(generation_clip_id)
             if bool(computed) and not bool(validated):
                 desc["computed"] = True
             segments = [dict(x) for x in manifest.get("segments", [])] + [desc]
@@ -3219,6 +3225,8 @@ def _write_preview_pcm_audio(
     fps,
     raw_audio_path,
     token,
+    individual_raw_audio_paths=None,
+    individual_errors=None,
 ):
     """Write exact timeline PCM for a progressive preview.
 
@@ -3278,6 +3286,27 @@ def _write_preview_pcm_audio(
                 wave, target, written_samples
             )
             _write_audio_raw(af, wave)
+
+            # Optional Full-Batch individual-clip export taps the exact same
+            # already-corrected timeline audio here. This is deliberately a
+            # byte-for-byte second write of the current final segment, not a
+            # second audio assembly pass. Any optional tap failure is recorded
+            # for the caller and must never prevent the normal final PCM from
+            # being completed.
+            if individual_raw_audio_paths is not None and i < len(individual_raw_audio_paths):
+                try:
+                    clip_audio_path = Path(individual_raw_audio_paths[i])
+                    clip_audio_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(clip_audio_path, "wb") as clip_af:
+                        _write_audio_raw(clip_af, wave)
+                except Exception as exc:
+                    if individual_errors is not None:
+                        individual_errors.append(
+                            f"clip {i + 1}: {exc}"
+                        )
+                    else:
+                        raise
+
             written_samples += int(wave.shape[-1])
             previous_tail = _audio_seam_tail(wave, sample_rate)
             del wave
@@ -3539,12 +3568,22 @@ def _export_final_from_exact_segment_caches(
     export_profile,
     audio_bitrate,
     token,
+    *,
+    save_individual_clips=False,
+    workflow=None,
+    prompt=None,
+    progress=None,
 ):
     """Mux a Full-Batch final from already-final video segments.
 
     Video operations are strictly packet-copy: per-clip exact-profile caches are
     concat-demuxed with ``-c:v copy`` and the resulting stream is copied again
     while the lossless PCM cache is encoded to the requested audio format.
+
+    When individual clip export is enabled, the exact already-processed audio
+    contribution of each clip is tapped while this single final PCM timeline is
+    being written. The individual exports then mux those captured PCM pieces
+    with the same final video sidecars; audio is never assembled a second time.
     """
     profile = normalize_full_batch_export_profile(export_profile)
     root = _ensure_cache_root()
@@ -3553,6 +3592,16 @@ def _export_final_from_exact_segment_caches(
     raw_audio = root / f"_{token}_final_audio.f32le"
     concat_log = root / f"_{token}_exact_concat.log"
     mux_log = root / f"_{token}_final_mux.log"
+    individual_audio_paths = []
+    individual_audio_errors = []
+    individual_export_info = {}
+
+    if bool(save_individual_clips):
+        individual_audio_paths = [
+            root / f"_{token}_clip_{i + 1:04d}.f32le"
+            for i in range(len(segments))
+        ]
+
     try:
         _concat_video_stream_copy(ffmpeg, segment_paths, joined_video, concat_log)
         sr, channels, _ = _write_preview_pcm_audio(
@@ -3563,6 +3612,10 @@ def _export_final_from_exact_segment_caches(
             float(fps),
             raw_audio,
             token,
+            individual_raw_audio_paths=(
+                individual_audio_paths if bool(save_individual_clips) else None
+            ),
+            individual_errors=individual_audio_errors,
         )
         _mux_final(
             ffmpeg,
@@ -3575,13 +3628,157 @@ def _export_final_from_exact_segment_caches(
             audio_bitrate,
             mux_log,
         )
-        return "exact_segment_stream_copy"
+
+        # The assembled final is already safely on disk before optional clip
+        # export begins. Any failure here is reported but never invalidates it.
+        if bool(save_individual_clips):
+            if individual_audio_errors:
+                message = (
+                    "H3 individual clip audio capture failed: "
+                    + "; ".join(individual_audio_errors)
+                )
+                _LOG.error("%s (assembled video preserved)", message)
+                individual_export_info = {"individual_clips_error": message}
+            else:
+                try:
+                    clips_dir, clip_paths = _export_individual_final_clips_from_pcm(
+                        ffmpeg=ffmpeg,
+                        segment_paths=segment_paths,
+                        individual_audio_paths=individual_audio_paths,
+                        output_path=output_path,
+                        export_profile=profile,
+                        audio_bitrate=audio_bitrate,
+                        sample_rate=sr,
+                        channels=channels,
+                        token=f"{token}_individual",
+                        workflow=workflow,
+                        prompt=prompt,
+                        progress=progress,
+                    )
+                    individual_export_info = {
+                        "individual_clips_dir": str(clips_dir),
+                        "individual_clips_count": int(len(clip_paths)),
+                    }
+                    _LOG.info(
+                        "H3 individual clips exported: clips=%d dir=%s",
+                        len(clip_paths), clips_dir,
+                    )
+                except Exception as exc:
+                    _LOG.error(
+                        "H3 individual clip export failed (assembled video preserved): %s",
+                        exc,
+                    )
+                    individual_export_info = {"individual_clips_error": str(exc)}
+
+        return "exact_segment_stream_copy", individual_export_info
     finally:
-        for item in (joined_video, raw_audio, concat_log, mux_log):
+        cleanup = [joined_video, raw_audio, concat_log, mux_log, *individual_audio_paths]
+        for item in cleanup:
             try:
                 Path(item).unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+
+def _next_individual_clips_dir(output_path):
+    """Allocate a sibling directory for one final video's per-clip exports."""
+    output_path = Path(output_path)
+    base = output_path.parent / f"{output_path.stem}_clips"
+    if not base.exists():
+        return base
+    for i in range(1, 1000000):
+        candidate = output_path.parent / f"{output_path.stem}_clips_{i:05d}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Disk Final Decode: could not allocate individual clips directory.")
+
+
+def _export_individual_final_clips_from_pcm(
+    ffmpeg,
+    segment_paths,
+    individual_audio_paths,
+    output_path,
+    export_profile,
+    audio_bitrate,
+    sample_rate,
+    channels,
+    token,
+    *,
+    workflow=None,
+    prompt=None,
+    progress=None,
+):
+    """Mux already-final video sidecars with PCM captured during final assembly.
+
+    No audio is decoded, corrected, trimmed or rebuilt here. Each PCM file was
+    written by ``_write_preview_pcm_audio`` from the exact processed waveform
+    that was simultaneously appended to the assembled video's final PCM.
+    Video remains packet-copy only.
+    """
+    profile = normalize_full_batch_export_profile(export_profile)
+    segment_paths = [Path(p) for p in segment_paths]
+    individual_audio_paths = [Path(p) for p in individual_audio_paths]
+    if len(segment_paths) != len(individual_audio_paths):
+        raise ValueError(
+            "H3 individual clip export: video/audio segment count mismatch."
+        )
+    if not segment_paths:
+        return None, []
+
+    extension = _full_batch_export_profile_extension(profile)
+    final_dir = _next_individual_clips_dir(output_path)
+    staging_dir = final_dir.with_name(f".{final_dir.name}.{uuid.uuid4().hex[:10]}.tmp")
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    staged_outputs = []
+
+    try:
+        for i, (video_path, raw_audio) in enumerate(
+            zip(segment_paths, individual_audio_paths)
+        ):
+            if not video_path.exists() or video_path.stat().st_size <= 0:
+                raise FileNotFoundError(
+                    f"H3 individual clip export: final video sidecar for clip {i + 1} is missing."
+                )
+            if not raw_audio.exists() or raw_audio.stat().st_size <= 0:
+                raise FileNotFoundError(
+                    f"H3 individual clip export: captured final audio for clip {i + 1} is missing."
+                )
+
+            mux_log = Path(raw_audio).with_suffix(".mux.log")
+            clip_name = f"{Path(output_path).stem}_clip_{i + 1:03d}.{extension}"
+            clip_output = staging_dir / clip_name
+            try:
+                _mux_final(
+                    ffmpeg,
+                    video_path,
+                    raw_audio,
+                    clip_output,
+                    int(sample_rate),
+                    int(channels),
+                    profile["codec"],
+                    audio_bitrate,
+                    mux_log,
+                )
+                _embed_final_metadata_in_place(
+                    clip_output, workflow=workflow, prompt=prompt
+                )
+                staged_outputs.append(clip_output)
+            finally:
+                try:
+                    mux_log.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            if progress is not None:
+                progress.advance()
+
+        os.replace(staging_dir, final_dir)
+        outputs = [final_dir / item.name for item in staged_outputs]
+        return final_dir, outputs
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
 
 def _full_batch_manifest_export_profile(manifest, requested_profile=None):
@@ -4525,7 +4722,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
         )
 
         preview_path = _reserve_preview_temp_path(final_id)
-        os.replace(temp_preview, preview_path)
+        shutil.move(temp_preview, preview_path)
 
         return {
             "path": preview_path,
@@ -5377,6 +5574,24 @@ def _resolve_stitch_params(
     return offset, mult, ckpt, fast, ensemble, skip
 
 
+def _maybe_auto_save_project(cache, output_path, final_id, settings, clip_count, frame_count):
+    if not settings or not settings.get("auto_save_project", False):
+        return {}
+    if not isinstance(cache, dict) or cache.get("run_mode") != "full_batch" or cache.get("interrupted", False):
+        return {}
+    try:
+        from .extender import _auto_save_full_batch_project
+        _LOG.info("H3: saving project for %s", output_path)
+        path = _auto_save_full_batch_project(cache, output_path, final_id, settings, clip_count, frame_count)
+        _LOG.info("H3: project saved: %s", path)
+        return {"project_autosave_path": path}
+    except Exception as exc:
+        # An archive failure must not discard the successfully exported video
+        # or abort an unattended queue. Surface it in both the log and preview.
+        _LOG.error("H3 Auto Save Project failed (video preserved): %s", exc)
+        return {"project_autosave_error": str(exc)}
+
+
 class MiniMaxH3MotionContextDiskFinalDecode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -5449,6 +5664,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     ["fp16", "bf16", "fp32"],
                     {"default": "bf16"},
                 ),
+                "auto_save_project": ("BOOLEAN", {"default": False, "tooltip": "Save a portable .ext project beside each completed Full Batch video. All three modes supported. Ignored in Clip-by-Clip and for interrupted batches. Large projects add disk space and saving time."}),
+                "save_individual_clips": ("BOOLEAN", {"default": False, "tooltip": "Full Batch only. Export each final user-visible clip beside the assembled video, with final video treatment and audio. Disabled leaves the existing export path unchanged."}),
             },
             "optional": {
                 # Optional Instagram / source clip for SeamlessVideoStitcher.
@@ -5581,6 +5798,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         unique_id=None,
         prompt=None,
         extra_pnginfo=None,
+        auto_save_project=False,
+        save_individual_clips=False,
     ):
         global _ACTIVE_UPSCALE_CTX
         if str(latent_layer or "").strip() == "":
@@ -5656,6 +5875,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 unique_id=unique_id,
                 prompt=prompt,
                 extra_pnginfo=extra_pnginfo,
+                auto_save_project=auto_save_project,
+                save_individual_clips=save_individual_clips,
             )
         finally:
             _ACTIVE_UPSCALE_CTX = None
@@ -5693,6 +5914,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         unique_id=None,
         prompt=None,
         extra_pnginfo=None,
+        auto_save_project=False,
+        save_individual_clips=False,
     ):
         # FPS is cache metadata, never a user choice. The compatibility widget
         # value above is deliberately ignored so old workflows keep their widget
@@ -5710,6 +5933,15 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 exc,
             )
             workflow = None
+        project_autosave_settings = None
+        if auto_save_project:
+            project_autosave_settings = {
+                "filename_prefix": filename_prefix, "output_directory": output_directory,
+                "codec": codec, "crf": crf, "preset": preset,
+                "audio_bitrate": audio_bitrate, "autoplay": autoplay,
+                "auto_save_project": True,
+                "save_individual_clips": bool(save_individual_clips),
+            }
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")
@@ -5749,6 +5981,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 filename_prefix=filename_prefix, output_directory=output_directory,
                 codec=codec, crf=crf, preset=preset, audio_bitrate=audio_bitrate,
                 unique_id=unique_id, workflow=workflow, prompt=prompt,
+                project_autosave_settings=project_autosave_settings,
+                save_individual_clips=bool(save_individual_clips),
             )
         if sequence_mode == "fl2va":
             from .fl2va_engine import export_fl2va_final
@@ -5757,6 +5991,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 filename_prefix=filename_prefix, output_directory=output_directory,
                 codec=codec, crf=crf, preset=preset, audio_bitrate=audio_bitrate,
                 unique_id=unique_id, workflow=workflow, prompt=prompt,
+                project_autosave_settings=project_autosave_settings,
+                save_individual_clips=bool(save_individual_clips),
             )
         color_timeline = _color_timeline(segments, float(fps))
         # Keep an unbaked copy for the preview strip even when stitch skips color bake.
@@ -6306,7 +6542,12 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         # starts the batch; Final Decode never transcodes an already compressed
         # cache and never has a project-wide VideoVAE path.
         progress = _FinalDecodeNativeProgress(
-            unique_id, total=max(8, 5 + (2 * len(segments)))
+            unique_id,
+            total=max(
+                8,
+                5 + (2 * len(segments))
+                + (len(segments) if bool(save_individual_clips) else 0),
+            ),
         )
         requested_profile = normalize_full_batch_export_profile({
             "codec": codec, "crf": crf, "preset": preset,
@@ -6384,7 +6625,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
 
         extension = _full_batch_export_profile_extension(export_profile)
         output_path = _next_output_path(out_dir, filename_prefix, extension)
-        final_video_mode = _export_final_from_exact_segment_caches(
+        final_video_mode, individual_export_info = _export_final_from_exact_segment_caches(
             ffmpeg=ffmpeg,
             segment_paths=exact_segment_paths,
             data_path=data_path,
@@ -6394,9 +6635,16 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             export_profile=export_profile,
             audio_bitrate=audio_bitrate,
             token=token,
+            save_individual_clips=bool(save_individual_clips),
+            workflow=workflow,
+            prompt=prompt,
+            progress=progress,
         )
 
         _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
+        project_autosave_info = _maybe_auto_save_project(
+            cache, output_path, unique_id, project_autosave_settings, len(segments), expected_frames
+        )
         progress.advance()
 
         _LOG.info(
@@ -6409,6 +6657,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             "ui": {
                 "h3_video": [item],
                 "h3_preview_info": [{
+                    **project_autosave_info,
+                    **individual_export_info,
                     "mode": "full_batch_incremental",
                     "clip": int(len(segments)),
                     "preview_frames": int(expected_frames),

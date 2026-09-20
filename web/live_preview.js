@@ -2114,6 +2114,36 @@ function makePlayer(node) {
     return state;
 }
 
+function clearPreviewForNewProject(ownerId) {
+    const graph = app.graph;
+    if (!graph) return;
+    const wanted = String(ownerId);
+    for (const node of graph._nodes || []) {
+        if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+        if (String(findUpstreamExtenderId(node)) !== wanted) continue;
+
+        const state = makePlayer(node);
+        state.liveLoaded = false;
+        // The active Extender cache is known to be empty after New Project; do
+        // not spend the normal workflow-restore retry window looking for it.
+        state.restoreLoaded = true;
+        state.restoreRequestRunning = false;
+        state.restoreModeOverride = null;
+        state.restoreMotionOverride = null;
+        state.currentVideoInfo = null;
+        state.currentPreviewMeta = null;
+        state.colorTimeline = [];
+        state.video.style.filter = "none";
+        state.saveButton.disabled = true;
+        state.label.textContent = "NEW PROJECT — preview cleared";
+        try {
+            state.video.pause();
+            state.video.removeAttribute("src");
+            state.video.load();
+        } catch (_) {}
+    }
+}
+
 function refreshImportedProjectPreview(ownerId, generationMode = null, motionContext = null) {
     const graph = app.graph;
     if (!graph) return;
@@ -2179,6 +2209,11 @@ app.registerExtension({
     },
 
     setup() {
+        window.addEventListener("h3-extender-new-project", (event) => {
+            const ownerId = event?.detail?.owner_id;
+            if (ownerId == null) return;
+            clearPreviewForNewProject(ownerId);
+        });
         window.addEventListener("h3-extender-project-loaded", (event) => {
             const ownerId = event?.detail?.owner_id;
             if (ownerId == null) return;
@@ -2355,6 +2390,15 @@ app.registerExtension({
             }
             applyLayerToggleUi(state);
             refreshLayerStatus(this, state);
+            if (meta?.project_autosave_error) {
+                state.label.textContent += " — PROJECT SAVE FAILED";
+                state.label.title = String(meta.project_autosave_error);
+            } else if (meta?.project_autosave_path) {
+                state.label.textContent += " — PROJECT SAVED";
+                state.label.title = String(meta.project_autosave_path);
+            } else {
+                state.label.title = "";
+            }
 
             state.currentVideoInfo = { ...info };
             state.currentPreviewMeta = {
