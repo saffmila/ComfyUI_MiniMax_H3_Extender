@@ -1195,14 +1195,21 @@ def _take_ref_video_h3_frames(video_frames, source_fps: float, start: int, end: 
     end = max(start, int(end))
     if end <= start:
         return video_frames[:0]
-    if abs(float(source_fps) - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
-        return video_frames[start:end]
+    source_count = int(video_frames.shape[0])
+    if source_count <= 0:
+        return video_frames[:0]
+    # Same-fps and single-frame sources: clamp indices so a short batch can be
+    # extended by repeating the last frame (H3 2s minimum pad path).
+    if abs(float(source_fps) - float(FPS)) < 1e-6 or source_count <= 1:
+        idx = torch.arange(start, end, device=video_frames.device)
+        idx = torch.clamp(idx, 0, source_count - 1)
+        return video_frames.index_select(0, idx)
 
     positions = torch.arange(
         start, end, device=video_frames.device, dtype=torch.float32
     )
     idx = torch.round(positions * (float(source_fps) / float(FPS))).to(torch.long)
-    idx = torch.clamp(idx, 0, int(video_frames.shape[0]) - 1)
+    idx = torch.clamp(idx, 0, source_count - 1)
     return video_frames.index_select(0, idx)
 
 
@@ -1238,7 +1245,11 @@ def _resize_ref_video_qwen_frames(
         return video_frames[:0, :int(height), :int(width), :3], target_positions
 
     if abs(float(source_fps) - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
-        selected = video_frames[target_positions]
+        idx = torch.tensor(
+            target_positions, device=video_frames.device, dtype=torch.long
+        )
+        idx = torch.clamp(idx, 0, max(0, int(video_frames.shape[0]) - 1))
+        selected = video_frames.index_select(0, idx)
     else:
         positions = torch.tensor(
             target_positions, device=video_frames.device, dtype=torch.float32
@@ -1628,10 +1639,24 @@ def _prepare_shared_refs(
         source_fps, full_h3_frames = _ref_video_h3_frame_count(
             video_frames, source_fps, f"ref_video_{slot}"
         )
-        if int(full_h3_frames) < int(2 * FPS):
+        min_ref_frames = int(2 * FPS)
+        if int(full_h3_frames) < 1:
             raise ValueError(
-                f"MiniMax H3 Extender: ref_video_{slot} is shorter than MiniMax H3's 2-second minimum at 24 fps."
+                f"MiniMax H3 Extender: ref_video_{slot} has no frames after 24 fps resample."
             )
+        if int(full_h3_frames) < min_ref_frames:
+            # Prefer completing the run over rejecting short refs (e.g. last-20
+            # Get Image from Batch). Later resize clamps indices so the pad is
+            # the last source frame repeated to a 2s @ 24 fps timeline.
+            pad = min_ref_frames - int(full_h3_frames)
+            _LOG.warning(
+                "MiniMax H3 Extender: ref_video_%s is %.2fs at 24 fps (< 2.00s); "
+                "padded %d frame(s) by repeating the last frame.",
+                slot,
+                float(full_h3_frames) / float(FPS),
+                int(pad),
+            )
+            full_h3_frames = min_ref_frames
 
         vh, vw = int(video_frames.shape[1]), int(video_frames.shape[2])
         cw, ch = _adapt_ref_video_canvas(vw, vh)

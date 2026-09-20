@@ -1879,6 +1879,62 @@ function isPddAccActive(node, runtime) {
     return Boolean(value) && value !== "None";
 }
 
+/** Mirror pdd_bridge.validate_pdd_file_for_mode filename heuristic. */
+function pddAccTrunkFromName(name) {
+    const low = String(name || "").toLowerCase().replace(/-/g, "_");
+    const hasFl = low.includes("fl2va");
+    const hasRef = low.includes("ref2va");
+    if (hasFl && !hasRef) return "fl2va";
+    if (hasRef && !hasFl) return "ref2va";
+    return null;
+}
+
+function pddAccModeMismatchMessage(pddFile, generationMode) {
+    const value = String(pddFile || "").trim();
+    if (!value || value === "None") return null;
+    const expected = String(generationMode || "ref2va").toLowerCase() === "fl2va" ? "fl2va" : "ref2va";
+    const trunk = pddAccTrunkFromName(value);
+    if (!trunk || trunk === expected) return null;
+    return (
+        `PDD Acc '${value}' looks like a ${trunk.toUpperCase()} distill, but generation mode is ${expected}. `
+        + `Use the matching ${expected.toUpperCase()} Acc LoRA (models/pdd_acc/).`
+    );
+}
+
+/**
+ * If the selected PDD Acc filename targets the other trunk, clear it to None
+ * and surface the reason in the Extender status (optionally via alert).
+ * Backend validate_pdd_file_for_mode remains the hard Queue-time guard.
+ */
+function enforcePddAccModeMatch(node, runtime, { alertUser = false } = {}) {
+    const widget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
+    if (!widget) return true;
+    const value = String(widget.value ?? "None").trim() || "None";
+    const mode = String(
+        runtime?.state?.generation_mode
+        || getWidget(node, "generation_mode")?.value
+        || "ref2va",
+    );
+    const message = pddAccModeMismatchMessage(value, mode);
+    if (!message) return true;
+
+    widget.value = "None";
+    for (const row of runtime?.pddAllRows || []) {
+        if (row?.__h3Widget === widget && row.__h3Select) {
+            row.__h3Select.value = "None";
+        }
+    }
+    if (runtime) runtime.statusText = message;
+    if (alertUser) {
+        try { alert(message); } catch (_) { /* headless / blocked */ }
+    }
+    syncModeSpecificNativeWidgets(node, runtime);
+    syncExtenderSections(node, runtime);
+    if (runtime?.status) runtime.status.textContent = runtime.statusText;
+    node?.graph?.setDirtyCanvas(true, true);
+    return false;
+}
+
 function syncModeSpecificNativeWidgets(node, runtime) {
     // Context lengths only affect causal Ref2VA Motion Context. They stay hidden
     // in FL2VA and in independent Ref2VA, while their saved values are preserved.
@@ -1912,6 +1968,7 @@ function installPddWidgetHooks(node, runtime) {
     const prev = pddWidget.callback;
     pddWidget.callback = function () {
         if (typeof prev === "function") prev.apply(this, arguments);
+        enforcePddAccModeMatch(node, runtime, { alertUser: true });
         syncModeSpecificNativeWidgets(node, runtime);
         syncExtenderSections(node, runtime);
         node?.graph?.setDirtyCanvas(true, true);
@@ -2280,9 +2337,11 @@ function buildExtenderSections(node, runtime) {
     runtime.pddDetailRows = [pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow];
     pddSection.__h3Body.append(pddLoraRow, pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow);
     pddLoraRow.__h3Select?.addEventListener("change", () => {
+        enforcePddAccModeMatch(node, runtime, { alertUser: true });
         syncModeSpecificNativeWidgets(node, runtime);
         syncExtenderSections(node, runtime);
         requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+        if (runtime.status) runtime.status.textContent = runtime.statusText || "Ready";
     });
 
     const refineSection = createCollapsibleSection("Latent refine", {
@@ -6570,6 +6629,8 @@ function buildUi(node) {
         runtime.cachedCount = 0;
         runtime.validatedCount = 0;
         runtime.cacheStateRestored = false;
+        // Drop a trunk-mismatched PDD Acc when flipping Ref2VA ↔ FL2VA.
+        enforcePddAccModeMatch(node, runtime, { alertUser: true });
         updateHidden(node, runtime);
         captureNativeWorkflowState(node, runtime);
         render(node, runtime);
@@ -7017,6 +7078,7 @@ function buildUi(node) {
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
     installPddWidgetHooks(node, runtime);
+    enforcePddAccModeMatch(node, runtime, { alertUser: false });
     syncExtenderSections(node, runtime);
     render(node, runtime);
     refreshLoraNames(node, runtime);
