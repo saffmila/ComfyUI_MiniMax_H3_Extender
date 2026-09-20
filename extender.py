@@ -141,7 +141,7 @@ REF_AUDIO_TIMELINE_SPLIT_SECONDS = 5.0
 MAX_CLIPS = 512
 MAX_FL2VA_GUIDES = 3
 DEFAULT_DURATION = 10.0
-DEFAULT_MEGAPIXELS = 0.40
+DEFAULT_MEGAPIXELS = 0.70
 MAX_RESOLUTION = 4096
 DEFAULT_SEED_MAX = (1 << 53) - 1  # exact integer range in browser JS
 
@@ -752,6 +752,8 @@ def _normalize_external_ref_pack(value):
         "version": int(value.get("version", 1) or 1),
         "source": str(value.get("source") or "External reference pack"),
         "count": sum(1 for image in slots if image is not None),
+        # Director / replace packs set this so empty slots wipe ghost internal refs.
+        "clear_empty": bool(value.get("clear_empty", False)),
         "slots": slots,
     }
 
@@ -774,8 +776,12 @@ def _local_picture_slot_reservations(clips):
 def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
     """Inject connected external slots into the existing internal Ref N slots.
 
-    Empty external slots are deliberately no-ops: they never clear or compact an
-    internal reference. Connected slots keep their exact logical number.
+    Connected slots keep their exact logical number.
+
+    Empty external slots:
+    - default (Reference Bridge): no-op — leave internal Ref N untouched
+    - ``clear_empty=True`` (Director replace packs): clear internal Ref N so
+      deleted Director cards cannot leave ghost images in the Extender store
 
     A slot already reserved by any clip-local Picture is skipped, not remapped and
     never treated as a fatal error. Local refs deliberately win so an external
@@ -783,15 +789,25 @@ def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
     """
     refs = _normalize_ref_descriptors(refs)
     if pack is None:
-        return refs, [], []
+        return refs, [], [], []
 
     reserved_slots = {int(x) for x in (reserved_slots or set()) if 1 <= int(x) <= MAX_IMAGE_REFS}
+    clear_empty = bool(pack.get("clear_empty", False))
     imported_slots = []
     skipped_slots = []
+    cleared_slots = []
     for index, image in enumerate(pack.get("slots") or [], start=1):
         if index > MAX_IMAGE_REFS:
             break
         if image is None:
+            if not clear_empty:
+                continue
+            if index in reserved_slots:
+                skipped_slots.append(index)
+                continue
+            if refs[index - 1] is not None:
+                refs[index - 1] = None
+                cleared_slots.append(index)
             continue
         if index in reserved_slots:
             skipped_slots.append(index)
@@ -815,7 +831,7 @@ def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
         if changed:
             imported_slots.append(index)
 
-    return refs, imported_slots, skipped_slots
+    return refs, imported_slots, skipped_slots, cleared_slots
 
 
 def _edit_internal_reference(source_id, original_name, brightness, contrast, saturation, external_signature=""):
@@ -2430,7 +2446,15 @@ def _send_extender_prompt_pack_import(node_id, clips_json, prompt_count, source=
         pass
 
 
-def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count, source="", skipped_slots=None):
+def _send_extender_ref_pack_import(
+    node_id,
+    refs_json,
+    imported_slots,
+    ref_count,
+    source="",
+    skipped_slots=None,
+    cleared_slots=None,
+):
     try:
         server = PromptServer.instance
         if server is None:
@@ -2442,6 +2466,7 @@ def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count
                 "refs_json": str(refs_json),
                 "imported_slots": [int(i) for i in imported_slots or []],
                 "skipped_slots": [int(i) for i in skipped_slots or []],
+                "cleared_slots": [int(i) for i in cleared_slots or []],
                 "ref_count": int(ref_count),
                 "source": str(source or "External reference pack"),
             },
@@ -3811,10 +3836,12 @@ class MiniMaxH3Extender:
         default_scheduler = "simple" if "simple" in scheduler_names else scheduler_names[0]
 
         try:
-            from .latent_upscaler import scan_upscale_models
+            from .latent_upscaler import default_upscale_model, scan_upscale_models
             _upscale_models = scan_upscale_models()
+            _default_upscale = default_upscale_model(_upscale_models)
         except Exception:
             _upscale_models = ["None"]
+            _default_upscale = "None"
 
         required = {
             "model": (
@@ -3947,14 +3974,14 @@ class MiniMaxH3Extender:
             "latent_upscale_model": (
                 _upscale_models,
                 {
-                    "default": "None",
+                    "default": _default_upscale,
                     "tooltip": "H3 latent upscaler weights from models/latent_upscale_models/. Used by run_refine.",
                 },
             ),
             "refine_megapixels": (
                 "FLOAT",
                 {
-                    "default": 1.0,
+                    "default": 1.2,
                     "min": 0.1,
                     "max": 8.0,
                     "step": 0.1,
@@ -3984,7 +4011,7 @@ class MiniMaxH3Extender:
             "latent_upscale_precision": (
                 ["fp16", "bf16", "fp32"],
                 {
-                    "default": "fp16",
+                    "default": "bf16",
                     "tooltip": "Compute precision for the latent upscaler during refine.",
                 },
             ),
@@ -4100,7 +4127,7 @@ class MiniMaxH3Extender:
             "ref_pack": (
                 REF_PACK_TYPE,
                 {
-                    "tooltip": "Optional external image-reference pack. Connected Ref N slots are imported into the matching internal Ref N slots on Queue; empty slots leave internal references untouched."
+                    "tooltip": "Optional external image-reference pack. Connected Ref N slots are imported into the matching internal Ref N slots on Queue. Empty slots leave internals untouched unless the pack sets clear_empty (Director does)."
                 },
             ),
             "prompt_pack": (
@@ -4725,10 +4752,10 @@ class MiniMaxH3Extender:
         pdd_head_strength=1.0,
         run_refine=False,
         latent_upscale_model="None",
-        refine_megapixels=1.0,
+        refine_megapixels=1.2,
         refine_denoise=0.3,
         refine_steps=4,
-        latent_upscale_precision="fp16",
+        latent_upscale_precision="bf16",
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -4828,12 +4855,16 @@ class MiniMaxH3Extender:
         refs = _parse_refs_json(refs_json)
         external_ref_pack = _normalize_external_ref_pack(ref_pack)
         local_picture_slots = _local_picture_slot_reservations(clips)
-        refs, ref_pack_imported_slots, ref_pack_skipped_slots = _sync_refs_from_ref_pack(
-            refs,
-            external_ref_pack,
-            local_picture_slots,
+        refs, ref_pack_imported_slots, ref_pack_skipped_slots, ref_pack_cleared_slots = (
+            _sync_refs_from_ref_pack(
+                refs,
+                external_ref_pack,
+                local_picture_slots,
+            )
         )
-        if (ref_pack_imported_slots or ref_pack_skipped_slots) and external_ref_pack is not None:
+        if (
+            ref_pack_imported_slots or ref_pack_skipped_slots or ref_pack_cleared_slots
+        ) and external_ref_pack is not None:
             _send_extender_ref_pack_import(
                 owner,
                 _refs_json(refs),
@@ -4841,6 +4872,7 @@ class MiniMaxH3Extender:
                 int(external_ref_pack.get("count", 0) or 0),
                 external_ref_pack.get("source") or "External reference pack",
                 skipped_slots=ref_pack_skipped_slots,
+                cleared_slots=ref_pack_cleared_slots,
             )
         refs_signature = _refs_signature(refs)
         requested_resolution = _resolve_generation_resolution(
@@ -5585,6 +5617,9 @@ class MiniMaxH3Extender:
             if ref_pack_imported_slots:
                 imported_text = ",".join(str(i) for i in ref_pack_imported_slots)
                 details.append(f"imported Ref {imported_text}")
+            if ref_pack_cleared_slots:
+                cleared_text = ",".join(str(i) for i in ref_pack_cleared_slots)
+                details.append(f"cleared Ref {cleared_text}")
             if ref_pack_skipped_slots:
                 skipped_text = ",".join(str(i) for i in ref_pack_skipped_slots)
                 details.append(f"ignored local-reserved Ref {skipped_text}")
@@ -5661,6 +5696,7 @@ class MiniMaxH3Extender:
             "ref_pack_count": int(external_ref_pack.get("count", 0) or 0) if external_ref_pack is not None else 0,
             "ref_pack_imported_slots": [int(i) for i in ref_pack_imported_slots],
             "ref_pack_skipped_slots": [int(i) for i in ref_pack_skipped_slots],
+            "ref_pack_cleared_slots": [int(i) for i in ref_pack_cleared_slots],
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "build": BUILD,
         }

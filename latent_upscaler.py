@@ -63,6 +63,16 @@ def scan_upscale_models():
     return ["None"] + names
 
 
+def default_upscale_model(models=None):
+    """Prefer bf16 H3 weights when present; else first real checkpoint; else None."""
+    names = list(models) if models is not None else scan_upscale_models()
+    real = [n for n in names if n and n != "None"]
+    for name in real:
+        if "bf16" in name.lower():
+            return name
+    return real[0] if real else "None"
+
+
 def _make_norm_tensors(device, dtype):
     mean = torch.tensor(LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
     std = torch.tensor(LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)

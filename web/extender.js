@@ -34,7 +34,7 @@ const MAX_IMAGE_REFS = 9;
 const MAX_MIXED_REFS = 12;
 const MAX_FL2VA_GUIDES = 3;
 const MAX_RESOLUTION = 4096;
-const DEFAULT_MEGAPIXELS = 0.40;
+const DEFAULT_MEGAPIXELS = 0.70;
 
 // Nodes 2.0 lifecycle guard. Workflow loading is bracketed by the official
 // beforeConfigureGraph/afterConfigureGraph extension hooks; while this flag is
@@ -3880,7 +3880,7 @@ function collectProjectPayload(node, runtime) {
             settings,
             resolution: {
                 mode: String(getWidget(node, "resolution_mode")?.value || "manual"),
-                megapixels: Number(getWidget(node, "megapixels")?.value ?? 0.40),
+                megapixels: Number(getWidget(node, "megapixels")?.value ?? DEFAULT_MEGAPIXELS),
                 manual_width: Number(runtime.manualWidth || settings.width || 0),
                 manual_height: Number(runtime.manualHeight || settings.height || 0),
                 resolved_width: Number(runtime.resolvedWidth || runtime.expectedResolution?.width || 0),
@@ -6732,9 +6732,13 @@ app.registerExtension({
             const skipped = Array.isArray(detail?.skipped_slots)
                 ? detail.skipped_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
                 : [];
+            const cleared = Array.isArray(detail?.cleared_slots)
+                ? detail.cleared_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
+                : [];
             const source = String(detail?.source || "External reference pack");
             const parts = [];
             if (slots.length) parts.push(`imported Ref ${slots.join(", ")}`);
+            if (cleared.length) parts.push(`cleared Ref ${cleared.join(", ")}`);
             if (skipped.length) parts.push(`ignored local-reserved Ref ${skipped.join(", ")}`);
             runtime.statusText = parts.length
                 ? `${source}: ${parts.join(" • ")}`

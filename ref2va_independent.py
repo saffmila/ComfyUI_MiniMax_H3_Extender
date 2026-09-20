@@ -619,10 +619,12 @@ def run(
     refs = e._parse_refs_json(refs_json)
     external_ref_pack = e._normalize_external_ref_pack(ref_pack)
     local_picture_slots = e._local_picture_slot_reservations(clips)
-    refs, ref_pack_imported_slots, ref_pack_skipped_slots = e._sync_refs_from_ref_pack(
-        refs, external_ref_pack, local_picture_slots
+    refs, ref_pack_imported_slots, ref_pack_skipped_slots, ref_pack_cleared_slots = (
+        e._sync_refs_from_ref_pack(refs, external_ref_pack, local_picture_slots)
     )
-    if (ref_pack_imported_slots or ref_pack_skipped_slots) and external_ref_pack is not None:
+    if (
+        ref_pack_imported_slots or ref_pack_skipped_slots or ref_pack_cleared_slots
+    ) and external_ref_pack is not None:
         e._send_extender_ref_pack_import(
             owner,
             e._refs_json(refs),
@@ -630,6 +632,7 @@ def run(
             int(external_ref_pack.get("count", 0) or 0),
             external_ref_pack.get("source") or "External reference pack",
             skipped_slots=ref_pack_skipped_slots,
+            cleared_slots=ref_pack_cleared_slots,
         )
 
     refs_signature = e._refs_signature(refs)
@@ -1093,6 +1096,8 @@ def run(
         details = []
         if ref_pack_imported_slots:
             details.append("imported Ref " + ",".join(str(x) for x in ref_pack_imported_slots))
+        if ref_pack_cleared_slots:
+            details.append("cleared Ref " + ",".join(str(x) for x in ref_pack_cleared_slots))
         if ref_pack_skipped_slots:
             details.append("ignored local-reserved Ref " + ",".join(str(x) for x in ref_pack_skipped_slots))
         ref_pack_text = f" | ref pack {connected_ref_count} linked"

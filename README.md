@@ -204,6 +204,8 @@ This keeps the Extender’s existing internal image-reference system fully intac
 
 **Added support for an external prompt pack through the new MiniMax H3 Prompt Pack Bridge node.**
 
+**Prompt Pack Merge:** concatenate several `H3_PROMPT_PACK` outputs (e.g. one Minimax Prompt Director per Extender clip) into a single pack for `Extender.prompt_pack`. Autogrowing `pack_1`, `pack_2`, … sockets — same compact-list behavior as the Bridge.
+
 ## Reference Pack Bridge
 
 A new node **MiniMax H3 Reference Pack Bridge** has been added.

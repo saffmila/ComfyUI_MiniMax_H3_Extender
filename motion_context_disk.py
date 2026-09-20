@@ -4097,12 +4097,28 @@ def _export_live_candidate_preview(
     preview_path = None
     root = _ensure_cache_root()
 
+    # Same repair full_batch already does: draft continuation / Extender without
+    # audio_vae can leave latents intact while decoded PCM meta is missing.
+    # Progressive preview needs that PCM before rebuilding the committed prefix.
+    manifest, segments = _ensure_ref2va_audio_cache(
+        data_path,
+        manifest_path,
+        manifest,
+        vae,
+        audio_vae,
+        float(fps),
+        count=len(segments),
+        progress=progress,
+    )
+    validated_count = _validated_prefix_count(segments)
+
     # Upgrade v14.42 lossless cached PCM once. This changes only small gain
     # metadata in the manifest; latents and validation states stay untouched.
     manifest = _upgrade_cached_audio_gain_chain(
         data_path, manifest_path, manifest, audio_vae, fps
     )
     segments = [dict(x) for x in manifest.get("segments", [])]
+    validated_count = _validated_prefix_count(segments)
 
     # Commit already validated clips into ONE persistent full preview cache.
     manifest, committed_path, committed_video_path = _sync_committed_preview(
@@ -5365,10 +5381,12 @@ class MiniMaxH3MotionContextDiskFinalDecode:
     @classmethod
     def INPUT_TYPES(cls):
         try:
-            from .latent_upscaler import scan_upscale_models
+            from .latent_upscaler import default_upscale_model, scan_upscale_models
             upscale_models = scan_upscale_models()
+            _default_upscale = default_upscale_model(upscale_models)
         except Exception:
             upscale_models = ["None"]
+            _default_upscale = "None"
         try:
             from .stitch_bridge import default_rife_ckpt, rife_ckpt_choices
 
@@ -5413,14 +5431,14 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "latent_upscale_model": (
                     upscale_models,
                     {
-                        "default": "None",
+                        "default": _default_upscale,
                         "tooltip": "Optional neural upscale of video latents right before VAE decode. Audio untouched. Skipped automatically when decoding refine.",
                     },
                 ),
                 "latent_upscale_megapixels": (
                     "FLOAT",
                     {
-                        "default": 1.0,
+                        "default": 1.2,
                         "min": 0.1,
                         "max": 8.0,
                         "step": 0.1,
@@ -5429,7 +5447,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 ),
                 "latent_upscale_precision": (
                     ["fp16", "bf16", "fp32"],
-                    {"default": "fp16"},
+                    {"default": "bf16"},
                 ),
             },
             "optional": {
@@ -5550,8 +5568,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         autoplay=True,
         latent_layer="auto",
         latent_upscale_model="None",
-        latent_upscale_megapixels=1.0,
-        latent_upscale_precision="fp16",
+        latent_upscale_megapixels=1.2,
+        latent_upscale_precision="bf16",
         original_images=None,
         ref_frames_offset=20,
         rife_multiplier=2,
@@ -5570,7 +5588,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         if str(latent_upscale_model or "").strip() == "":
             latent_upscale_model = "None"
         if str(latent_upscale_precision or "").strip() == "":
-            latent_upscale_precision = "fp16"
+            latent_upscale_precision = "bf16"
 
         (
             ref_frames_offset,
@@ -5636,6 +5654,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 rife_ensemble=rife_ensemble,
                 ai_skip_first=ai_skip_first,
                 unique_id=unique_id,
+                prompt=prompt,
+                extra_pnginfo=extra_pnginfo,
             )
         finally:
             _ACTIVE_UPSCALE_CTX = None
@@ -5671,6 +5691,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         rife_ensemble=True,
         ai_skip_first=1,
         unique_id=None,
+        prompt=None,
+        extra_pnginfo=None,
     ):
         # FPS is cache metadata, never a user choice. The compatibility widget
         # value above is deliberately ignored so old workflows keep their widget
@@ -5678,7 +5700,16 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         fps = float(manifest.get("fps", FPS))
         if not math.isfinite(fps) or fps <= 0.0:
             raise ValueError(f"Disk Final Decode: invalid cached fps {fps!r}.")
-        workflow = _workflow_from_extra_pnginfo(extra_pnginfo)
+        # Workflow metadata is optional; missing/invalid EXTRA_PNGINFO must not
+        # abort the video export.
+        try:
+            workflow = _workflow_from_extra_pnginfo(extra_pnginfo)
+        except Exception as exc:
+            _LOG.warning(
+                "Disk Final Decode: failed to read workflow from extra_pnginfo: %s",
+                exc,
+            )
+            workflow = None
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")

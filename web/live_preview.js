@@ -159,15 +159,20 @@ function ensureLatentUpscaleWidgetDefaults(node) {
     }
     const model = getWidget(node, "latent_upscale_model");
     if (model && (model.value === "" || model.value == null)) {
-        model.value = "None";
+        // Prefer bf16 H3 weights when present; else first real checkpoint.
+        const opts = model.options || model.values || [];
+        const list = Array.isArray(opts) ? opts : [];
+        const bf16 = list.find((v) => v && v !== "None" && String(v).toLowerCase().includes("bf16"));
+        const any = list.find((v) => v && v !== "None");
+        model.value = bf16 || any || "None";
     }
     const precision = getWidget(node, "latent_upscale_precision");
     if (precision && (precision.value === "" || precision.value == null)) {
-        precision.value = "fp16";
+        precision.value = "bf16";
     }
     const mp = getWidget(node, "latent_upscale_megapixels");
     if (mp && (mp.value === "" || mp.value == null || Number.isNaN(Number(mp.value)))) {
-        mp.value = 1.0;
+        mp.value = 1.2;
     }
     ensureStitchWidgetDefaults(node);
 }
