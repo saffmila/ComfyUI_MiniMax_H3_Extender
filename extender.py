@@ -102,7 +102,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v2.8.2"
+BUILD = "minimax-h3-extender-v2.8.3"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
