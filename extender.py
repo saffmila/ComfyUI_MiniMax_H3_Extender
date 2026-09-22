@@ -4253,8 +4253,8 @@ def _capture_full_batch_project(function):
                     "megapixels": settings["megapixels"],
                     "manual_width": settings["width"],
                     "manual_height": settings["height"],
-                    "resolved_width": state["resolved_width"],
-                    "resolved_height": state["resolved_height"],
+                    "resolved_width": int(state.get("resolved_width") or settings.get("width") or 0),
+                    "resolved_height": int(state.get("resolved_height") or settings.get("height") or 0),
                     "guide_ref": state.get("resolution_guide", ""),
                     "fallback": bool(state.get("resolution_fallback", False)),
                 },
@@ -5571,6 +5571,19 @@ class MiniMaxH3Extender:
                     "refined": True,
                     "run_refine": True,
                     "draft_then_refine": bool(draft_then_refine),
+                    # Same resolution keys as the draft path so full_batch
+                    # project capture / autosave does not KeyError after refine.
+                    "resolved_width": int(resolved_width),
+                    "resolved_height": int(resolved_height),
+                    "resolution_mode": str(resolution.get("mode") or "manual"),
+                    "resolution_guide": (
+                        f"ref_{int(resolution['guide_ref'])}"
+                        if resolution.get("guide_ref") is not None
+                        else ""
+                    ),
+                    "resolution_fallback": bool(resolution.get("fallback", False)),
+                    "megapixels": float(resolution.get("megapixels", megapixels)),
+                    "refs_json": _refs_json(refs),
                 }
                 return {
                     "ui": {"h3_extender_state": [ui_state]},
